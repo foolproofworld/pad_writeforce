@@ -6,6 +6,7 @@
 
 - `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），小文件随机分配到多个线程以模拟多文件同步，并按设定的间隔强制插入大文件写入；每次推送后会通过远端 `stat` 校验文件尺寸，记录所有操作与错误到 CSV，在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态与累计运行时间进度条。
 - `file_generator.py`：一键在桌面生成上述 `pad_test.iso` 和 1000 个 100KB 文档（默认目录 `~/Desktop/pad_small_files`，命名为 `doc_XXXX.txt`），参数可自定义路径、数量与大小。
+- 额外加入温度/卡死监测：定期采样 thermal/battery 温度，高于阈值或长时间无成功推送时自动全量清空并落表，以暴露更多潜在异常。
 
 ## 环境与前置条件
 
@@ -35,6 +36,50 @@
    - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
    - 默认运行 168 小时，随机将小文件分配给多个线程并周期性插入大文件推送，持续制造并发写入；当可用空间低于 5 GB 时触发清理，并会在 `adb` 断联时自动尝试等待重连。
    - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）。
+
+## 运行逻辑与并发策略（中文详解）
+
+### 推送顺序与并发模型
+
+- 默认启动 3 个 worker 线程（`num_workers` 可调），每个线程独立循环执行：检测剩余空间→确保设备在线→选择下一份 payload→推送→视结果做校验或清理→休眠 `poll_interval_seconds` 秒。
+- Payload 队列在内存中共享：
+  - 大文件 `pad_test.iso` 作为「强制插入」任务，间隔由 `large_push_interval` 控制（默认 10 次小文件后强插 1 次），保证大文件在长跑中持续出现，而不是等小文件跑完才推送。
+  - 小文件从 `doc_*.txt` 列表中随机抽取，多个线程并行抽样，天然打乱顺序，符合「多文件同时传输」的同步场景模拟。
+
+### 成功判定与校验机制
+
+- 每次 `adb push` 成功返回后会立即通过 `stat -c %s` 读取远端文件大小，与本地尺寸严格比对：
+  - 匹配则写入 `verify_success` 事件，更新成功计数与累计流量。
+  - 不匹配或 `stat` 失败则回滚一次成功计数、增加失败计数，记录 `verify_failed`，并触发一次全量清空以暴露潜在写入异常或文件系统损坏。
+- `adb push` 返回非零（权限、IO、断链等）会记录细分事件（如 `push_nospace`、`push_readonly`、`push_permission`、`push_ioerror`），并触发对应的清理：
+  - 检测到 “No space left” 时立即整目录清空、重建后继续写入，确保每次写满后都能重新开始。
+  - 其他错误则按线程互斥清理，方便下一次尝试继续跑压测并把错误落表。
+  - 推送命令超时会记为 `push_timeout` 并立即全量清空，避免因卡死/阻塞而长时间无法写入。
+
+### 空间管理与清理
+
+- 每轮都会调用 `df -k` 同时查询目标目录、`/sdcard`、`/storage/emulated/0`，最大程度拿到可用空间数值；解析失败会落表 `free_space_unknown` 便于排查 df 输出异常。
+- 当剩余空间低于 `free_space_threshold_mb`（默认 5 GB）或推送失败提示空间耗尽时，直接执行全量清空（`wipe_all`），随后重建目标目录，保证在多次写满后也能立刻恢复写入。常规错误则保持原有批量删除（`cleanup_deleted`）策略。
+- 清理/清空过程均会记录成功或失败事件（`cleanup_failed`、`cleanup_error`、`wipe_all_error`），避免单次异常导致测试停机且便于追踪。
+
+### 设备连接与重试
+
+- 启动时用 `adb devices` 确认至少一台设备可用；运行中每轮调用 `get-state` 判断在线状态。
+- 若离线，记录 `device_retry` 并等待 `reconnect_delay_seconds` 秒，再执行最长 120 秒的 `wait-for-device`，仍失败则落表 `device_missing`，其他线程继续尝试，测试不中断。
+
+### 设备健康/卡死监测
+
+- 温度采样：独立线程每 `health_check_interval` 秒读取 `/sys/class/thermal/thermal_zone*/temp` 或 `dumpsys battery` 温度；成功时写入 `thermal_sample`，高于 `thermal_limit_c`（默认 65℃）记为 `thermal_high`，帮助关联“过热导致中断/降速”类问题。
+- 卡死/停滞检测：若连续 `stall_timeout_minutes` 分钟（默认 10 分钟）无任何成功推送，会写入 `stall_detected` 并触发一次全量清空重置环境，避免长时间卡死掩盖错误。
+
+### 日志与可观测性
+
+- 所有关键事件写入 CSV（UTC 时间），字段：`timestamp`、`event`、`message`、`free_space_mb`、`extra`；典型事件值包含 `start`、`push_success`、`verify_failed`、`push_nospace`、`push_readonly`、`push_timeout`、`thermal_high`、`stall_detected`、`free_space_unknown`、`wipe_all`、`device_retry`、`worker_error`、`complete` 等，可直接按事件过滤定位“空间不足/推送超时/过热/卡死”等问题来源。
+- GUI 实时拉取状态：
+  - 文本状态栏显示最近事件描述（线程编号、校验结果等）。
+  - 统计栏展示推送成功/失败、清理次数、累计流量。
+  - 「累计运行时长」进度条按配置的 `run_hours` 计算总秒数，持续累进，直观观察长跑测试覆盖度。
+  - 日志滚动窗口附加所有状态消息，便于现场观察和截图留存。
 
 ## 打包为 Windows 可执行文件
 
@@ -70,5 +115,6 @@ pyinstaller --onefile file_generator.py
 
 - 脚本会自动检测 `adb` 设备；如需固定设备，可在 `StressTestConfig` 中设置 `device_id`。
 - CSV 日志包含每次推送、清理与错误信息，并记录远端尺寸校验是否通过，可实时导入 Excel/BI 做监控；字段包括时间戳、事件类型、消息、剩余空间与附加信息。
-- 当空间不足或推送失败时，会按小批量删除最旧文件以腾出空间，确保在多次写满后仍能继续运行。推送失败会触发一次清理并继续尝试。
+- 当空间不足或推送失败提示磁盘写满时，会整目录清空后重建；其他错误仍按小批量删除最新文件释放空间，确保多线程不会互相踩踏并能继续运行。
+- 建议在 CSV 中按 `event` 字段筛选（如 `push_timeout`、`push_nospace`、`thermal_high`、`stall_detected`），可快速定位错误来源、复盘是否与过热/卡死/空间不足相关。
 - 如设备 I/O 较慢，可适当增大 `poll_interval_seconds`，或调低 `num_workers` 以降低瞬时压力；若希望更猛的并发可增大 `num_workers`。

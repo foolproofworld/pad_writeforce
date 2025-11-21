@@ -1,11 +1,11 @@
 # 存储压力测试工具集
 
-本仓库提供两个适用于 Windows 环境、通过 `adb` 驱动的 Python 脚本，用于对安卓平板执行长时间存储压力测试，并生成本地占位文件以配合测试。主脚本支持 7×24 小时连续写入、自动清理空间、实时 CSV 落表和错误记录，便于检视平板在多次写满场景下的稳定性。
+本仓库提供两个适用于 Windows 环境、通过 `adb` 驱动的 Python 脚本，用于对安卓平板执行长时间存储压力测试，并生成本地占位文件以配合测试。主脚本支持 7×24 小时多线程连续写入、自动清理空间、实时 CSV 落表和错误记录，并带有 Tk 图形界面显示推送进度、状态与日志，便于检视平板在多次写满场景下的稳定性。
 
 ## 文件说明
 
-- `storage_stress.py`：通过 `adb` 持续向平板指定目录推送随机大小的空白文件，记录所有操作与错误到 CSV，并在空间不足或推送失败时自动分批删除旧文件，以确保测试不中断。
-- `file_generator.py`：在本地生成任意大小（单位 MB）的空白文件，方便自定义上传载荷，或预先构造多组测试文件。
+- `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 小文件，记录所有操作与错误到 CSV，并在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态。
+- `file_generator.py`：一键在桌面生成上述 `pad_test.iso` 和 1000 个 100KB 小文件（默认目录 `~/Desktop/pad_small_files`），参数可自定义路径、数量与大小。
 
 ## 环境与前置条件
 
@@ -19,19 +19,22 @@
    python -m pip install --upgrade pip
    ```
 
-2. **运行存储压力测试：**
+2. **生成测试文件（必需）：**
+   ```powershell
+   python file_generator.py
+   ```
+   - 默认会在桌面生成 `pad_test.iso`（约 2GB，占位视频或压缩包）以及 `pad_small_files/` 下的 1000 个 100KB 文档。
+   - 如需只生成某一类或调整路径，可用：
+     - 仅生成大文件：`python file_generator.py --mode iso --iso-path D:\pad_test.iso --iso-size-gb 2`
+     - 仅生成小文件包：`python file_generator.py --mode small --small-dir D:\pad_small_files --small-count 1000 --small-size-kb 100`
+
+3. **运行存储压力测试：**
    ```powershell
    python storage_stress.py
    ```
-   - 日志会写入 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
-   - 默认运行 168 小时，每次推送 100/500/1024 MB 的文件，当可用空间低于 5 GB 时触发清理。
-   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`file_sizes_mb`、`free_space_threshold_mb`、`cleanup_batch_size` 等）。
-
-3. **生成空白文件（可选）：**
-   ```powershell
-   python file_generator.py C:\path\to\payload.bin 512
-   ```
-   上述命令会生成一个 512 MB 的空白文件。
+   - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量以及实时事件日志，CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
+   - 默认运行 168 小时，循环推送桌面大文件和 1000 个小文件，当可用空间低于 5 GB 时触发清理，并会在 `adb` 断联时自动尝试等待重连。
+   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）。
 
 ## 打包为 Windows 可执行文件
 
@@ -68,4 +71,4 @@ pyinstaller --onefile file_generator.py
 - 脚本会自动检测 `adb` 设备；如需固定设备，可在 `StressTestConfig` 中设置 `device_id`。
 - CSV 日志包含每次推送、清理与错误信息，可实时导入 Excel/BI 做监控；字段包括时间戳、事件类型、消息、剩余空间与附加信息。
 - 当空间不足或推送失败时，会按小批量删除最旧文件以腾出空间，确保在多次写满后仍能继续运行。
-- 如设备 I/O 较慢，可适当增大 `poll_interval_seconds` 或减小 `file_sizes_mb`，以降低瞬时压力。
+- 如设备 I/O 较慢，可适当增大 `poll_interval_seconds`，或调低 `num_workers` 以降低瞬时压力；若希望更猛的并发可增大 `num_workers`。

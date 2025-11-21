@@ -141,6 +141,23 @@ def ensure_local_logs(config: StressTestConfig) -> None:
     os.makedirs(config.local_log_dir, exist_ok=True)
 
 
+def detect_device(config: StressTestConfig) -> None:
+    """提前校验 MTP 连接与必需文件，便于在启动 GUI 前快速报错。"""
+
+    # 确认大/小文件存在
+    load_payloads(config)
+
+    # 确认日志目录可写
+    ensure_local_logs(config)
+
+    # 确认 MTP 设备可连接、目标目录可创建
+    client = MTPClient(config)
+    try:
+        client.free_space_mb()
+    finally:
+        client.close()
+
+
 def load_payloads(config: StressTestConfig) -> List[Path]:
     if not config.large_payload.exists():
         raise RuntimeError(f"缺少大文件: {config.large_payload}")

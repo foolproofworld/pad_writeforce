@@ -10,6 +10,12 @@
 - **健康监测**：温度采样、长时间无成功推送卡死检测，异常时自动重置测试环境并记录。
 - **错误专用日志**：除 CSV 外额外输出 `storage_errors_*.log`，实时汇总所有错误/异常事件，便于快速定位问题。
 
+### 常见启动问题与解决（出现 “name 'detect_device' is not defined” 时）
+- **确认脚本未被截断**：请确保你拉取的是最新版本，文件尾部保留 `if __name__ == "__main__": detect_device(cfg); build_ui(cfg)` 入口。如果脚本被拷贝缺行或仍是旧版本，就会报 `name 'detect_device' is not defined`。
+- **安装依赖再运行**：新机器先安装 `pymtp`（必须）以及可选的 `adb`：`python -m pip install --upgrade pip pymtp`。若使用虚拟环境，可运行 `python -m venv .venv` 然后 `.\.venv\Scripts\pip install pymtp`。
+- **在仓库根目录执行**：切到包含 `storage_stress.py` 的目录运行：`python storage_stress.py`。若在虚拟环境中，则用 `.\.venv\Scripts\python.exe storage_stress.py`。
+- **打包后重新构建**：如你在旧版本上打过包，需按下文 “Windows 加速打包与分发” 重新执行 `build_windows.ps1` 或 PyInstaller，确保新的脚本（含 `detect_device`）被打入 exe 中。
+
 ## 文件说明
 
 - `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），小文件随机分配到多个线程以模拟多文件同步，并按设定的间隔强制插入大文件写入；每次推送后会通过远端 `stat` 校验文件尺寸，记录所有操作与错误到 CSV，在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态与累计运行时间进度条。

@@ -76,7 +76,7 @@ class MTPClient:
     def ensure_folder_path(self, path: str) -> int:
         segments = [seg for seg in path.replace("\\", "/").split("/") if seg]
         parent_id = 0  # root
-        folder_list = self.device.get_folder_list()
+        folder_list = self.device.get_folder_list() or []
         for seg in segments:
             folder_id = None
             for folder in folder_list:
@@ -85,7 +85,7 @@ class MTPClient:
                     break
             if folder_id is None:
                 folder_id = self.device.create_folder(seg, parent_id, self.storage_id)
-                folder_list = self.device.get_folder_list()
+                folder_list = self.device.get_folder_list() or []
             parent_id = folder_id
         return parent_id
 
@@ -101,7 +101,8 @@ class MTPClient:
 
     def list_files(self) -> List[Tuple[int, str, int]]:
         files = []
-        for item in self.device.get_filelisting():
+        listing = self.device.get_filelisting() or []
+        for item in listing:
             try:
                 parent_id = getattr(item, "parent_id", getattr(item, "parent", 0))
                 if parent_id == self.target_folder_id:

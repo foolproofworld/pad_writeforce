@@ -4,7 +4,7 @@
 
 ## 文件说明
 
-- `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），记录所有操作与错误到 CSV，并在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态。
+- `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），小文件随机分配到多个线程以模拟多文件同步，并按设定的间隔强制插入大文件写入；每次推送后会通过远端 `stat` 校验文件尺寸，记录所有操作与错误到 CSV，在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态与累计运行时间进度条。
 - `file_generator.py`：一键在桌面生成上述 `pad_test.iso` 和 1000 个 100KB 文档（默认目录 `~/Desktop/pad_small_files`，命名为 `doc_XXXX.txt`），参数可自定义路径、数量与大小。
 
 ## 环境与前置条件
@@ -32,8 +32,8 @@
    ```powershell
    python storage_stress.py
    ```
-   - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量以及实时事件日志，CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
-   - 默认运行 168 小时，循环推送桌面大文件和 1000 个小文件，当可用空间低于 5 GB 时触发清理，并会在 `adb` 断联时自动尝试等待重连。
+   - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
+   - 默认运行 168 小时，随机将小文件分配给多个线程并周期性插入大文件推送，持续制造并发写入；当可用空间低于 5 GB 时触发清理，并会在 `adb` 断联时自动尝试等待重连。
    - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）。
 
 ## 打包为 Windows 可执行文件
@@ -69,6 +69,6 @@ pyinstaller --onefile file_generator.py
 ## 实战提示
 
 - 脚本会自动检测 `adb` 设备；如需固定设备，可在 `StressTestConfig` 中设置 `device_id`。
-- CSV 日志包含每次推送、清理与错误信息，可实时导入 Excel/BI 做监控；字段包括时间戳、事件类型、消息、剩余空间与附加信息。
-- 当空间不足或推送失败时，会按小批量删除最旧文件以腾出空间，确保在多次写满后仍能继续运行。
+- CSV 日志包含每次推送、清理与错误信息，并记录远端尺寸校验是否通过，可实时导入 Excel/BI 做监控；字段包括时间戳、事件类型、消息、剩余空间与附加信息。
+- 当空间不足或推送失败时，会按小批量删除最旧文件以腾出空间，确保在多次写满后仍能继续运行。推送失败会触发一次清理并继续尝试。
 - 如设备 I/O 较慢，可适当增大 `poll_interval_seconds`，或调低 `num_workers` 以降低瞬时压力；若希望更猛的并发可增大 `num_workers`。

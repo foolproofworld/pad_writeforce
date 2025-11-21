@@ -7,8 +7,10 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import ttk
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from random import choice
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -27,6 +29,7 @@ class StressTestConfig:
     cleanup_batch_size: int = 5
     reconnect_delay_seconds: int = 10
     num_workers: int = 3
+    large_push_interval: int = 10
 
 
 @dataclass
@@ -230,7 +233,20 @@ def ensure_device_ready(
     return False
 
 
-def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue) -> None:
+def verify_remote_size(config: StressTestConfig, remote_path: str, expected_size: int) -> Tuple[bool, str]:
+    code, out, err = run_adb_command(config, ["shell", "stat", "-c", "%s", remote_path], timeout=30)
+    if code != 0:
+        return False, err or out or "stat failed"
+    try:
+        remote_size = int(out.strip())
+    except ValueError:
+        return False, f"unexpected stat output: {out}"
+    if remote_size != expected_size:
+        return False, f"size mismatch remote={remote_size} local={expected_size}"
+    return True, ""
+
+
+def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time: datetime) -> None:
     ensure_local_logs(config)
     payloads = load_payloads(config)
     ensure_target_dir(config)
@@ -247,19 +263,23 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue) -> None:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        end_time = datetime.utcnow() + timedelta(hours=config.run_hours)
+        end_time = start_time + timedelta(hours=config.run_hours)
         stop_event = threading.Event()
         writer.writerow(record_event("start", "测试开始", config, check_free_space(config)))
         ui_queue.put({"type": "status", "message": "测试已启动", "stats": stats})
 
-        payload_index = 0
+        small_payloads = payloads[1:]
+        large_payload = payloads[0]
+        pushes_since_large = config.large_push_interval
 
         def next_payload() -> Path:
-            nonlocal payload_index
+            nonlocal pushes_since_large
             with payload_lock:
-                path = payloads[payload_index % len(payloads)]
-                payload_index += 1
-                return path
+                if pushes_since_large >= config.large_push_interval:
+                    pushes_since_large = 0
+                    return large_payload
+                pushes_since_large += 1
+            return choice(small_payloads)
 
         def worker(worker_id: int) -> None:
             try:
@@ -292,6 +312,38 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue) -> None:
                     file_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_w{worker_id}_{payload.name}"
 
                     success = push_file(config, payload, file_name, writer, writer_lock, stats, stats_lock, worker_id)
+                    if success:
+                        expected = payload.stat().st_size
+                        remote_path = posixpath.join(config.target_dir.rstrip("/\\"), file_name)
+                        ok, reason = verify_remote_size(config, remote_path, expected)
+                        if not ok:
+                            with stats_lock:
+                                if stats.success > 0:
+                                    stats.success -= 1
+                                stats.failures += 1
+                                stats.last_event = f"[线程{worker_id}] 校验失败: {reason}"
+                            with writer_lock:
+                                writer.writerow(
+                                    record_event(
+                                        "verify_failed",
+                                        reason,
+                                        config,
+                                        check_free_space(config),
+                                        f"worker={worker_id}, path={remote_path}",
+                                    )
+                                )
+                            success = False
+                        else:
+                            with writer_lock:
+                                writer.writerow(
+                                    record_event(
+                                        "verify_success",
+                                        "remote size matched",
+                                        config,
+                                        check_free_space(config),
+                                        f"worker={worker_id}, path={remote_path}",
+                                    )
+                                )
                     if not success:
                         with cleanup_lock:
                             cleanup_device_storage(config, writer, writer_lock, "push_failure")
@@ -329,17 +381,24 @@ def build_ui(config: StressTestConfig) -> None:
 
     root = tk.Tk()
     root.title("存储压力测试监控")
-    root.geometry("520x320")
+    root.geometry("560x360")
+
+    start_time = datetime.utcnow()
+    total_seconds = config.run_hours * 3600
 
     status_var = tk.StringVar(value="等待开始...")
     progress_var = tk.StringVar(value="已推送 0/0 成功/失败")
     cleanup_var = tk.StringVar(value="清理次数: 0")
     bytes_var = tk.StringVar(value="累计传输: 0 MB")
+    time_var = tk.StringVar(value=f"累计运行: 0.00h / {config.run_hours}h")
 
     tk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", padx=10, pady=5)
     tk.Label(root, textvariable=progress_var, anchor="w").pack(fill="x", padx=10, pady=5)
     tk.Label(root, textvariable=cleanup_var, anchor="w").pack(fill="x", padx=10, pady=5)
     tk.Label(root, textvariable=bytes_var, anchor="w").pack(fill="x", padx=10, pady=5)
+    tk.Label(root, textvariable=time_var, anchor="w").pack(fill="x", padx=10, pady=5)
+    progress_bar = ttk.Progressbar(root, mode="determinate", maximum=total_seconds)
+    progress_bar.pack(fill="x", padx=10, pady=5)
 
     log_box = tk.Text(root, height=10)
     log_box.pack(fill="both", expand=True, padx=10, pady=5)
@@ -354,6 +413,11 @@ def build_ui(config: StressTestConfig) -> None:
                 progress_var.set(f"推送: {stats.success} 成功 / {stats.failures} 失败 (总尝试 {stats.pushes})")
                 cleanup_var.set(f"清理次数: {stats.cleanups}")
                 bytes_var.set(f"累计传输: {stats.bytes_sent // 1024 // 1024} MB")
+                elapsed = max(0.0, (datetime.utcnow() - start_time).total_seconds())
+                progress_bar["value"] = min(elapsed, total_seconds)
+                time_var.set(
+                    f"累计运行: {elapsed / 3600:.2f}h / {config.run_hours}h"
+                )
 
                 log_box.configure(state="normal")
                 log_box.insert("end", f"{datetime.utcnow().strftime('%H:%M:%S')} - {event.get('message','')}\n")
@@ -363,7 +427,7 @@ def build_ui(config: StressTestConfig) -> None:
             pass
         root.after(500, update_ui)
 
-    worker = threading.Thread(target=run_stress_test, args=(config, ui_queue), daemon=True)
+    worker = threading.Thread(target=run_stress_test, args=(config, ui_queue, start_time), daemon=True)
     worker.start()
     root.after(500, update_ui)
     root.mainloop()

@@ -2,6 +2,13 @@
 
 本仓库提供两个适用于 Windows 环境、通过 `adb` 驱动的 Python 脚本，用于对安卓平板执行长时间存储压力测试，并生成本地占位文件以配合测试。主脚本支持 7×24 小时多线程连续写入、自动清理空间、实时 CSV 落表和错误记录，并带有 Tk 图形界面显示推送进度、状态与日志，便于检视平板在多次写满场景下的稳定性。
 
+## 技术要点速览
+
+- **多线程流水线**：1 个 producer + 多个 worker 并行推送，随机小文件与定期大文件交错写入，队列容量可调以提升压力。
+- **空间与错误自愈**：`df` 多路径检测、超阈值或写满即全量清空；推送失败按错误类型落表并触发互斥清理，确保持续运行。
+- **校验与观测**：每次推送后 `stat` 校验远端尺寸，CSV 细分事件（空间/权限/超时/过热/卡死等），GUI 显示并行度、进度条与实时日志。
+- **健康监测**：温度采样、长时间无成功推送卡死检测，异常时自动重置测试环境并记录。
+
 ## 文件说明
 
 - `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），小文件随机分配到多个线程以模拟多文件同步，并按设定的间隔强制插入大文件写入；每次推送后会通过远端 `stat` 校验文件尺寸，记录所有操作与错误到 CSV，在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态与累计运行时间进度条。
@@ -87,35 +94,46 @@
   - 「累计运行时长」进度条按配置的 `run_hours` 计算总秒数，持续累进，直观观察长跑测试覆盖度。
   - 日志滚动窗口附加所有状态消息，便于现场观察和截图留存。
 
-## 打包为 Windows 可执行文件
+## 打包为 Windows 可执行文件（启动加速版）
 
-使用 PyInstaller 生成无需 Python 环境的可执行文件：
+以下方法均在 Windows 10/11、64 位 Python 上验证。为避免 `--onefile` 解压导致的“首启卡顿”，推荐使用 `--onedir` 模式。
+
+### 方式 1：脚本一键打包（推荐）
+1. PowerShell 进入仓库根目录，执行：
+   ```powershell
+   .\build_windows.ps1
+   ```
+   - 首次运行会自动创建 `.venv` 并安装 PyInstaller。
+   - 生成的目录：`dist/storage_stress/` 和 `dist/file_generator/`，连同目录整体复制到新电脑即可运行。
+
+2. 新电脑上直接运行 `dist/storage_stress/storage_stress.exe` 或 `dist/file_generator/file_generator.exe`，无需 Python。`--onedir` 不会在启动时解压大包，冷启动更快。
+
+### 方式 2：手动命令
+1. 安装依赖：
+   ```powershell
+   python -m pip install --upgrade pip pyinstaller
+   ```
+
+2. 在仓库根目录执行：
+   ```powershell
+   pyinstaller --noconfirm --onedir --clean --name storage_stress storage_stress.py
+   pyinstaller --noconfirm --onedir --clean --name file_generator file_generator.py
+   ```
+
+### 启动/编译加速技巧与排查
+- **首启卡顿**：避免 `--onefile`；给 `dist/` 目录加杀毒/Defender 例外；确保从本地盘运行。
+- **构建变慢**：复用 `.venv`，脚本会跳过重复安装；必要时删除 `.venv`、`build/`、`dist/` 重新打包。
+- **缺少 Tk/GUI**：请使用官方 64 位 Python，安装时勾选 “tcl/tk and IDLE”；若缺少可 `python -m pip install tk` 后重试。
+- **杀软误报**：将生成的 EXE 加入白名单或签名，脚本仅依赖标准库和 ADB。
+
+### 高级：更快的可执行文件
+若希望更接近原生启动速度，可使用 Nuitka（需要 VS Build Tools/C 编译器）：
 ```powershell
-python -m pip install pyinstaller
-pyinstaller --onefile storage_stress.py
-pyinstaller --onefile file_generator.py
+python -m pip install nuitka
+nuitka --onefile --windows-console-mode=disable --follow-imports storage_stress.py
+nuitka --onefile --windows-console-mode=disable --follow-imports file_generator.py
 ```
-生成的文件会出现在 `dist/` 目录下，可直接在目标机器运行。
-
-### 关于「为什么用 Python」以及 exe 启动慢的缓解办法
-
-- **选择 Python 的原因：**
-  - 直接复用 `adb` 命令，逻辑清晰，便于在现场快速改参数、排查问题。
-  - 依赖极少，脚本本身可读性高，方便后续扩展（如增加更多日志字段或自定义清理策略）。
-- **PyInstaller 打包后初次启动卡顿的现象：** `--onefile` 模式会先在临时目录解压依赖，所以第一次运行会有较长的解包时间。
-  - 若需要更快启动，可改用 `--onedir` 模式，避免每次解压：
-    ```powershell
-    pyinstaller --onedir --noconfirm --clean storage_stress.py
-    pyinstaller --onedir --noconfirm --clean file_generator.py
-    ```
-  - 也可以直接使用系统已安装的 Python 解释器运行脚本，跳过打包过程，启动即执行。
-  - 追求接近原生的启动速度时，可尝试 `nuitka` 编译（需要 VS Build Tools），通常比 `--onefile` 更快：
-    ```powershell
-    python -m pip install nuitka
-    python -m nuitka --standalone --onefile --mingw64 storage_stress.py
-    python -m nuitka --standalone --onefile --mingw64 file_generator.py
-    ```
-    Nuitka 会生成独立目录（或单文件），首次启动无需解压大体积依赖，冷启动体验更好。
+Nuitka 打包时间更长，但运行时启动更快；适合在稳定环境复用产物。
 
 ## 实战提示
 

@@ -63,15 +63,29 @@ class MTPClient:
         self.device = pymtp.MTP()
         self.device.connect()
         try:
-            storages = self.device.get_storage() or []
+            storages = self.device.get_storage()
         except TypeError as exc:  # noqa: BLE001
             raise RuntimeError(
                 "设备未正确以 MTP 枚举（get_storage 返回 None），请检查数据线/驱动后重试"
             ) from exc
+
+        if storages is None:
+            raise RuntimeError(
+                "MTP 设备未正常枚举（get_storage 返回 None），请更换数据线或重新插拔后重试"
+            )
+        if not isinstance(storages, (list, tuple)):
+            raise RuntimeError(
+                f"无法解析 MTP 存储列表（类型 {type(storages)}），请检查驱动并重试"
+            )
         if not storages:
             raise RuntimeError("未检测到 MTP 存储，请检查设备是否以 MTP 模式连接")
 
-        target_storage = self._select_storage(storages, config)
+        try:
+            target_storage = self._select_storage(storages, config)
+        except TypeError as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "解析 MTP 存储列表失败（返回值不可迭代），请重连设备后再试"
+            ) from exc
         self.storage_id = target_storage.id
         self.device.set_default_storage(self.storage_id)
         self.target_folder_id = self.ensure_folder_path(config.target_dir)

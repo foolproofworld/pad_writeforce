@@ -103,13 +103,14 @@ def list_device_files(config: StressTestConfig) -> List[str]:
 
 
 def cleanup_device_storage(
-    config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, reason: str
+    config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, error_log, reason: str
 ) -> None:
     try:
         files = list_device_files(config)
     except Exception as exc:  # noqa: BLE001
         with writer_lock:
             csv_writer.writerow(record_event("cleanup_failed", str(exc), config, None, reason))
+            log_error_line(error_log, f"cleanup_failed: {exc}")
         return
 
     removed = 0
@@ -124,10 +125,11 @@ def cleanup_device_storage(
         else:
             with writer_lock:
                 csv_writer.writerow(record_event("cleanup_error", err, config, None, path))
+                log_error_line(error_log, f"cleanup_error: {err} ({path})")
 
 
 def wipe_device_storage(
-    config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, reason: str
+    config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, error_log, reason: str
 ) -> None:
     """清空目标目录下所有文件，适用于磁盘写满或校验失败后的快速恢复。"""
     code, _, err = run_adb_command(config, ["shell", "rm", "-rf", posixpath.join(config.target_dir, "*")])
@@ -140,6 +142,7 @@ def wipe_device_storage(
             csv_writer.writerow(
                 record_event("wipe_all_error", err or "wipe failed", config, check_free_space(config), reason)
             )
+            log_error_line(error_log, f"wipe_all_error: {err or 'wipe failed'}")
 
     ensure_target_dir(config)
 
@@ -247,21 +250,27 @@ def record_event(event_type: str, message: str, config: StressTestConfig, free_s
     }
 
 
+def log_error_line(log_file, message: str) -> None:
+    log_file.write(f"{datetime.utcnow().isoformat()} | {message}\n")
+    log_file.flush()
+
+
 def push_file(
     config: StressTestConfig,
     local_path: Path,
     remote_name: str,
     csv_writer: csv.DictWriter,
     writer_lock: threading.Lock,
+    error_log,
     stats: StressStats,
     stats_lock: threading.Lock,
     worker_id: int,
 ) -> Tuple[bool, str]:
     remote_path = posixpath.join(config.target_dir.rstrip("/\\"), remote_name)
-    code, out, err = run_adb_command(config, ["push", str(local_path), remote_path], timeout=config.push_timeout)
     with stats_lock:
         stats.pushes += 1
         stats.inflight_pushes += 1
+    code, out, err = run_adb_command(config, ["push", str(local_path), remote_path], timeout=config.push_timeout)
     if code == 0:
         size = local_path.stat().st_size
         with stats_lock:
@@ -309,6 +318,7 @@ def push_file(
                 f"worker={worker_id}, path={remote_path}",
             )
         )
+        log_error_line(error_log, f"{event_label}: {error_message} ({remote_path})")
     with stats_lock:
         if stats.inflight_pushes > 0:
             stats.inflight_pushes -= 1
@@ -333,6 +343,7 @@ def ensure_device_ready(
     config: StressTestConfig,
     writer: csv.DictWriter,
     writer_lock: threading.Lock,
+    error_log,
     stats: StressStats,
     stats_lock: threading.Lock,
 ) -> bool:
@@ -341,6 +352,7 @@ def ensure_device_ready(
         return True
     with writer_lock:
         writer.writerow(record_event("device_retry", err or out or "device not ready", config, check_free_space(config)))
+        log_error_line(error_log, f"device_retry: {err or out}")
     with stats_lock:
         stats.last_event = "等待设备重新连接"
     time.sleep(config.reconnect_delay_seconds)
@@ -349,6 +361,7 @@ def ensure_device_ready(
         return True
     with writer_lock:
         writer.writerow(record_event("device_missing", wait_err or wait_out, config, check_free_space(config)))
+        log_error_line(error_log, f"device_missing: {wait_err or wait_out}")
     return False
 
 
@@ -380,8 +393,11 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
     )
 
     log_path = os.path.join(config.local_log_dir, f"storage_stress_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
+    error_log_path = os.path.join(config.local_log_dir, f"storage_errors_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log")
 
-    with open(log_path, "w", newline="", encoding="utf-8") as csvfile:
+    with open(log_path, "w", newline="", encoding="utf-8") as csvfile, open(
+        error_log_path, "w", encoding="utf-8"
+    ) as error_log:
         fieldnames = ["timestamp", "event", "message", "free_space_mb", "extra"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -447,15 +463,17 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                 writer.writerow(
                                     record_event("cleanup_needed", "剩余空间低于阈值，执行全量清空", config, free_space)
                                 )
+                                log_error_line(error_log, "cleanup_needed: free space below threshold")
                             with cleanup_lock:
-                                wipe_device_storage(config, writer, writer_lock, "low_free_space")
+                                wipe_device_storage(config, writer, writer_lock, error_log, "low_free_space")
                             ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
                             continue
                         elif free_space is None:
                             with writer_lock:
                                 writer.writerow(record_event("free_space_unknown", "无法解析 df 输出", config, None))
+                                log_error_line(error_log, "free_space_unknown: df parse failed")
 
-                        if not ensure_device_ready(config, writer, writer_lock, stats, stats_lock):
+                        if not ensure_device_ready(config, writer, writer_lock, error_log, stats, stats_lock):
                             ui_queue.put({"type": "status", "message": "等待设备重连失败，稍后重试", "stats": stats})
                             continue
 
@@ -472,7 +490,9 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                             stats.last_event = f"[线程{worker_id}] 正在推送 {payload.name}"
                         ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
 
-                        success, push_err = push_file(config, payload, file_name, writer, writer_lock, stats, stats_lock, worker_id)
+                        success, push_err = push_file(
+                            config, payload, file_name, writer, writer_lock, error_log, stats, stats_lock, worker_id
+                        )
                         if success:
                             expected = payload.stat().st_size
                             remote_path = posixpath.join(config.target_dir.rstrip("/\\"), file_name)
@@ -493,8 +513,9 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                             f"worker={worker_id}, path={remote_path}",
                                         )
                                     )
+                                    log_error_line(error_log, f"verify_failed: {reason} ({remote_path})")
                                 with cleanup_lock:
-                                    wipe_device_storage(config, writer, writer_lock, "verify_failure")
+                                    wipe_device_storage(config, writer, writer_lock, error_log, "verify_failure")
                                 success = False
                             else:
                                 with writer_lock:
@@ -512,21 +533,22 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                 with stats_lock:
                                     stats.last_event = "存储已满，执行全量清理"
                                 with cleanup_lock:
-                                    wipe_device_storage(config, writer, writer_lock, "no_space")
+                                    wipe_device_storage(config, writer, writer_lock, error_log, "no_space")
                             elif "timeout" in push_err.lower():
                                 with stats_lock:
                                     stats.last_event = "推送超时，执行全量清理并重试"
                                 with cleanup_lock:
-                                    wipe_device_storage(config, writer, writer_lock, "push_timeout")
+                                    wipe_device_storage(config, writer, writer_lock, error_log, "push_timeout")
                             else:
                                 with cleanup_lock:
-                                    cleanup_device_storage(config, writer, writer_lock, "push_failure")
+                                    cleanup_device_storage(config, writer, writer_lock, error_log, "push_failure")
                         ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
                     finally:
                         task_queue.task_done()
             except Exception as exc:  # noqa: BLE001
                 with writer_lock:
                     writer.writerow(record_event("worker_error", str(exc), config, check_free_space(config)))
+                    log_error_line(error_log, f"worker_error: {exc}")
                 with stats_lock:
                     stats.last_event = f"线程 {worker_id} 异常: {exc}"
                 ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
@@ -556,9 +578,12 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                         event_type = "thermal_high"
                     with writer_lock:
                         writer.writerow(record_event(event_type, message, config, check_free_space(config), raw))
+                        if event_type != "thermal_sample":
+                            log_error_line(error_log, f"{event_type}: {message}")
                 except Exception as exc:  # noqa: BLE001
                     with writer_lock:
                         writer.writerow(record_event("health_unknown", str(exc), config, check_free_space(config)))
+                        log_error_line(error_log, f"health_unknown: {exc}")
 
                 # 长时间无成功推送判定为卡死/停滞
                 now_ts = time.time()
@@ -576,10 +601,13 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                 check_free_space(config),
                             )
                         )
+                        log_error_line(
+                            error_log, f"stall_detected: no success for {config.stall_timeout_minutes}分钟"
+                        )
                     with stats_lock:
                         stats.last_event = "检测到长时间无成功推送，执行全量清空"
                     with cleanup_lock:
-                        wipe_device_storage(config, writer, writer_lock, "stall_detected")
+                        wipe_device_storage(config, writer, writer_lock, error_log, "stall_detected")
                     ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
 
                 for _ in range(config.health_check_interval):

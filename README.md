@@ -8,6 +8,7 @@
 - **空间与错误自愈**：`df` 多路径检测、超阈值或写满即全量清空；推送失败按错误类型落表并触发互斥清理，确保持续运行。
 - **校验与观测**：每次推送后 `stat` 校验远端尺寸，CSV 细分事件（空间/权限/超时/过热/卡死等），GUI 显示并行度、进度条与实时日志。
 - **健康监测**：温度采样、长时间无成功推送卡死检测，异常时自动重置测试环境并记录。
+- **错误专用日志**：除 CSV 外额外输出 `storage_errors_*.log`，实时汇总所有错误/异常事件，便于快速定位问题。
 
 ## 文件说明
 
@@ -40,7 +41,7 @@
    ```powershell
    python storage_stress.py
    ```
-   - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志、活跃线程数，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
+    - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志、活跃线程数，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间），所有错误实时汇总到 `logs/storage_errors_<timestamp>.log` 便于快速定位异常。
    - 默认运行 168 小时，随机将小文件分配给多个线程并周期性插入大文件推送，持续制造并发写入；当可用空间低于 5 GB 时触发清理，并会在 `adb` 断联时自动尝试等待重连。
    - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）；也可在启动前通过环境变量快速提高并发与队列深度：
      - `STRESS_NUM_WORKERS`：worker 线程数（默认 8，适合强调并发写入压力）
@@ -54,10 +55,11 @@
 - 默认启动 8 个 worker 线程（`num_workers` 可调，亦可用环境变量设置）**再加 1 个 producer 线程**负责持续填充任务队列：
   - producer 以 `large_push_interval` 为节奏强插大文件，空档随机抽取小文件，并为每个任务生成独立时间戳/队列深度前缀，确保大文件在长跑中穿插出现。
   - worker 线程从队列中并行抢占任务，独立执行：检测剩余空间→确保设备在线→落表 `push_begin`→推送→校验/清理→回写状态，无需等待其他线程完成，真正并行传输。
-- 并发可视化：
-  - GUI 增加 “并行中的推送” 计数（`inflight_pushes`）和活跃线程数，可直观看到是否存在多条推送同时执行。
-  - CSV/GUI 的 `worker_start`、`push_begin`、`push_success`/`push_failed` 时间戳可交叉验证同一时间窗口是否有传输重叠。
-- 任务队列容量为 `num_workers * task_queue_multiplier`（默认系数 8），既保证随时有任务可抢，又避免一次性排太多旧时间戳的文件名；必要时可用 `STRESS_QUEUE_MULT` 提升排队深度，扩大瞬时并行机会。
+  - 并发可视化：
+    - GUI 增加 “并行中的推送” 计数（`inflight_pushes`）和活跃线程数，可直观看到是否存在多条推送同时执行。
+    - CSV/GUI 的 `worker_start`、`push_begin`、`push_success`/`push_failed` 时间戳可交叉验证同一时间窗口是否有传输重叠。
+    - 任务队列容量为 `num_workers * task_queue_multiplier`（默认系数 8），既保证随时有任务可抢，又避免一次性排太多旧时间戳的文件名；必要时可用 `STRESS_QUEUE_MULT` 提升排队深度，扩大瞬时并行机会。
+    - ADB 并行性说明：每个 worker 都会启动独立的 `adb push` 子进程并行工作，但部分设备/ROM 会限制同一 USB 连接同时只有一个 sync 会话，导致带宽在设备端被串行化。此时可以通过日志看到多线程尝试（多条 `push_begin`、`push_success` 时间重叠），但物理吞吐可能仍受限，这是 ADB/设备栈的限制而非脚本未并行。
 
 ### 成功判定与校验机制
 
@@ -88,6 +90,7 @@
 ### 日志与可观测性
 
 - 所有关键事件写入 CSV（UTC 时间），字段：`timestamp`、`event`、`message`、`free_space_mb`、`extra`；典型事件值包含 `start`、`push_success`、`verify_failed`、`push_nospace`、`push_readonly`、`push_timeout`、`thermal_high`、`stall_detected`、`free_space_unknown`、`wipe_all`、`device_retry`、`worker_error`、`complete` 等，可直接按事件过滤定位“空间不足/推送超时/过热/卡死”等问题来源。
+- 错误专用日志：`logs/storage_errors_<timestamp>.log` 以秒级追加方式汇总推送失败、校验失败、清理异常、设备离线、温度过高、卡死触发等错误，便于直接打开文本快速查看异常原因。
 - GUI 实时拉取状态：
   - 文本状态栏显示最近事件描述（线程编号、校验结果等）。
   - 统计栏展示推送成功/失败、清理次数、累计流量。

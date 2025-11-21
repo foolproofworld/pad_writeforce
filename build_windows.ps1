@@ -17,7 +17,7 @@ $venvPython = Join-Path $venvPath 'Scripts/python.exe'
 $venvPip = Join-Path $venvPath 'Scripts/pip.exe'
 
 & $venvPip install --upgrade pip > $null
-& $venvPip install --upgrade pyinstaller > $null
+& $venvPip install --upgrade pyinstaller pymtp > $null
 
 $commonArgs = @('--noconfirm', '--onedir', '--clean')
 

@@ -1,6 +1,5 @@
 import csv
 import os
-import posixpath
 import queue
 import subprocess
 import sys
@@ -18,7 +17,8 @@ from typing import Dict, List, Optional, Tuple
 @dataclass
 class StressTestConfig:
     device_id: Optional[str] = None
-    target_dir: str = "/sdcard/storage_stress"
+    mtp_storage_id: Optional[int] = None
+    target_dir: str = "storage_stress"
     local_log_dir: str = "logs"
     large_payload: Path = Path.home() / "Desktop" / "pad_test.iso"
     small_payload_dir: Path = Path.home() / "Desktop" / "pad_small_files"
@@ -49,28 +49,92 @@ class StressStats:
     inflight_pushes: int = 0
 
 
-def adb_base_args(device_id: Optional[str]) -> List[str]:
-    args = ["adb"]
-    if device_id:
-        args.extend(["-s", device_id])
-    return args
+class MTPClient:
+    """轻量封装 pymtp，提供路径创建、推送、清理等操作。"""
 
+    def __init__(self, config: StressTestConfig):
+        try:
+            import pymtp  # type: ignore
+        except ImportError as exc:  # noqa: BLE001
+            raise RuntimeError("缺少依赖 pymtp，请先 pip install pymtp") from exc
 
-def run_adb_command(config: StressTestConfig, command: List[str], timeout: int = 30) -> Tuple[int, str, str]:
-    full_cmd = adb_base_args(config.device_id) + command
-    process = subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        return -1, "", f"Timeout running {' '.join(full_cmd)}"
-    return process.returncode, stdout.strip(), stderr.strip()
+        self._pymtp = pymtp
+        self.device = pymtp.MTP()
+        self.device.connect()
+        storages = self.device.get_storage()
+        if not storages:
+            raise RuntimeError("未检测到 MTP 存储，请检查设备是否以 MTP 模式连接")
+
+        if config.mtp_storage_id:
+            target_storage = next((s for s in storages if s.id == config.mtp_storage_id), storages[0])
+        else:
+            target_storage = storages[0]
+        self.storage_id = target_storage.id
+        self.device.set_default_storage(self.storage_id)
+        self.target_folder_id = self.ensure_folder_path(config.target_dir)
+
+    def ensure_folder_path(self, path: str) -> int:
+        segments = [seg for seg in path.replace("\\", "/").split("/") if seg]
+        parent_id = 0  # root
+        folder_list = self.device.get_folder_list()
+        for seg in segments:
+            folder_id = None
+            for folder in folder_list:
+                if folder.storage_id == self.storage_id and folder.parent_id == parent_id and folder.name == seg:
+                    folder_id = folder.folder_id
+                    break
+            if folder_id is None:
+                folder_id = self.device.create_folder(seg, parent_id, self.storage_id)
+                folder_list = self.device.get_folder_list()
+            parent_id = folder_id
+        return parent_id
+
+    def free_space_mb(self) -> Optional[int]:
+        storages = self.device.get_storage()
+        for st in storages:
+            if st.id == self.storage_id:
+                try:
+                    return int(st.free_space_in_bytes) // (1024 * 1024)
+                except Exception:  # noqa: BLE001
+                    return None
+        return None
+
+    def list_files(self) -> List[Tuple[int, str, int]]:
+        files = []
+        for item in self.device.get_filelisting():
+            try:
+                parent_id = getattr(item, "parent_id", getattr(item, "parent", 0))
+                if parent_id == self.target_folder_id:
+                    obj_id = getattr(item, "id", getattr(item, "item_id", None))
+                    if obj_id is None:
+                        continue
+                    files.append((obj_id, item.filename, getattr(item, "filesize", getattr(item, "size", 0))))
+            except Exception:  # noqa: BLE001
+                continue
+        return files
+
+    def send_file(self, local_path: Path, remote_name: str) -> None:
+        self.device.send_file_from_file(str(local_path), self.target_folder_id, remote_name)
+
+    def delete_object(self, obj_id: int) -> None:
+        self.device.delete_object(obj_id)
+
+    def stat_file(self, remote_name: str) -> Optional[int]:
+        for obj_id, name, size in self.list_files():
+            if name == remote_name:
+                return size
+        return None
+
+    def close(self) -> None:
+        try:
+            self.device.disconnect()
+        except Exception:
+            pass
 
 
 def ensure_target_dir(config: StressTestConfig) -> None:
-    code, _, err = run_adb_command(config, ["shell", "mkdir", "-p", config.target_dir])
-    if code != 0:
-        raise RuntimeError(f"Failed to create target directory: {err}")
+    client = MTPClient(config)
+    client.close()
 
 
 def ensure_local_logs(config: StressTestConfig) -> None:
@@ -90,23 +154,11 @@ def load_payloads(config: StressTestConfig) -> List[Path]:
     return [config.large_payload] + small_files
 
 
-def list_device_files(config: StressTestConfig) -> List[str]:
-    code, out, err = run_adb_command(config, ["shell", "ls", "-t", config.target_dir])
-    if code != 0:
-        raise RuntimeError(f"Failed to list device files: {err}")
-    files = []
-    for line in out.splitlines():
-        line = line.strip()
-        if line:
-            files.append(os.path.join(config.target_dir, line))
-    return files
-
-
 def cleanup_device_storage(
-    config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, error_log, reason: str
+    client: MTPClient, config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, error_log, reason: str
 ) -> None:
     try:
-        files = list_device_files(config)
+        files = client.list_files()
     except Exception as exc:  # noqa: BLE001
         with writer_lock:
             csv_writer.writerow(record_event("cleanup_failed", str(exc), config, None, reason))
@@ -114,101 +166,66 @@ def cleanup_device_storage(
         return
 
     removed = 0
-    for path in files:
+    for obj_id, name, _ in files:
         if removed >= config.cleanup_batch_size:
             break
-        code, _, err = run_adb_command(config, ["shell", "rm", "-f", path])
-        if code == 0:
+        try:
+            client.delete_object(obj_id)
             removed += 1
             with writer_lock:
-                csv_writer.writerow(record_event("cleanup_deleted", "", config, None, path))
-        else:
+                csv_writer.writerow(record_event("cleanup_deleted", "", config, None, name))
+        except Exception as exc:  # noqa: BLE001
             with writer_lock:
-                csv_writer.writerow(record_event("cleanup_error", err, config, None, path))
-                log_error_line(error_log, f"cleanup_error: {err} ({path})")
+                csv_writer.writerow(record_event("cleanup_error", str(exc), config, None, name))
+                log_error_line(error_log, f"cleanup_error: {exc} ({name})")
 
 
 def wipe_device_storage(
-    config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, error_log, reason: str
+    client: MTPClient, config: StressTestConfig, csv_writer: csv.DictWriter, writer_lock: threading.Lock, error_log, reason: str
 ) -> None:
     """清空目标目录下所有文件，适用于磁盘写满或校验失败后的快速恢复。"""
-    code, _, err = run_adb_command(config, ["shell", "rm", "-rf", posixpath.join(config.target_dir, "*")])
+    errors: List[str] = []
+    try:
+        files = client.list_files()
+        for obj_id, name, _ in files:
+            try:
+                client.delete_object(obj_id)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(str(exc))
+
     with writer_lock:
-        if code == 0:
+        if errors:
             csv_writer.writerow(
-                record_event("wipe_all", "已清空目标目录", config, check_free_space(config), reason)
+                record_event("wipe_all_error", "; ".join(errors), config, client.free_space_mb(), reason)
             )
+            log_error_line(error_log, f"wipe_all_error: {'; '.join(errors)}")
         else:
-            csv_writer.writerow(
-                record_event("wipe_all_error", err or "wipe failed", config, check_free_space(config), reason)
-            )
-            log_error_line(error_log, f"wipe_all_error: {err or 'wipe failed'}")
-
-    ensure_target_dir(config)
+            csv_writer.writerow(record_event("wipe_all", "已清空目标目录", config, client.free_space_mb(), reason))
 
 
-def parse_free_space_mb(df_output: str, mount_path: str) -> Optional[int]:
-    for line in df_output.splitlines():
-        # Android df 输出通常为：Filesystem 1K-blocks Used Available Use% Mounted on
-        # 可能出现目标目录不在 Mounted on 列，只能匹配包含的路径前缀。
-        if mount_path in line or mount_path.rstrip("/") == line.split()[-1]:
-            parts = line.split()
-            if len(parts) >= 4:
-                try:
-                    available_kb = int(parts[3])
-                    return available_kb // 1024
-                except ValueError:
-                    return None
-    return None
-
-
-def check_free_space(config: StressTestConfig) -> Optional[int]:
-    # 一次性查询多个常见挂载点，尽量避免解析失败导致的 "unknown"
-    code, out, err = run_adb_command(
-        config,
-        [
-            "shell",
-            "df",
-            "-k",
-            config.target_dir,
-            "/sdcard",
-            "/storage/emulated/0",
-            "/data",
-        ],
-    )
-    if code != 0:
-        return None
-
-    for mount in (config.target_dir, "/sdcard", "/storage/emulated/0", "/data"):
-        value = parse_free_space_mb(out, mount)
-        if value is not None:
-            return value
-
-    # 回退: 使用 stat -f 解析 bavail
-    s_code, s_out, _ = run_adb_command(
-        config,
-        ["shell", "stat", "-f", "-c", "%a %S", config.target_dir],
-    )
-    if s_code == 0:
-        try:
-            avail_blocks, block_size = s_out.split()
-            return (int(avail_blocks) * int(block_size)) // (1024 * 1024)
-        except Exception:  # noqa: BLE001
-            return None
-    return None
+def check_free_space(client: MTPClient) -> Optional[int]:
+    return client.free_space_mb()
 
 
 def sample_device_temperature(config: StressTestConfig) -> Tuple[Optional[float], str, str]:
-    """尝试读取设备温度，优先 thermal_zone，退化到 battery 温度。"""
-    # 读取 thermal_zone，可能返回多行摄氏乘以 1000 的值
-    code, out, err = run_adb_command(
-        config,
-        [
-            "shell",
-            "for f in /sys/class/thermal/thermal_zone*/temp; do [ -f \"$f\" ] && cat \"$f\"; done",
-        ],
-        timeout=15,
-    )
+    """MTP 模式下无法直接读取温度，若系统存在 adb 则尝试辅助采样。"""
+    import shutil
+    adb_path = shutil.which("adb")
+    if not adb_path:
+        return None, "unsupported", "adb not available for temp sampling"
+
+    def run_local_adb(args: List[str]) -> Tuple[int, str, str]:
+        process = subprocess.Popen([adb_path] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return -1, "", "timeout"
+        return process.returncode, out.strip(), err.strip()
+
+    code, out, err = run_local_adb(["shell", "for f in /sys/class/thermal/thermal_zone*/temp; do [ -f \"$f\" ] && cat \"$f\"; done"])
     raw_output = out or err
     if code == 0 and raw_output:
         temps: List[float] = []
@@ -224,8 +241,7 @@ def sample_device_temperature(config: StressTestConfig) -> Tuple[Optional[float]
         if temps:
             return max(temps), "thermal_zone", raw_output
 
-    # 回退到 dumpsys battery temperature（以 0.1 摄氏度为单位）
-    b_code, b_out, b_err = run_adb_command(config, ["shell", "dumpsys", "battery"], timeout=15)
+    b_code, b_out, b_err = run_local_adb(["shell", "dumpsys", "battery"])
     battery_raw = b_out or b_err
     if b_code == 0 and battery_raw:
         for line in battery_raw.splitlines():
@@ -256,6 +272,7 @@ def log_error_line(log_file, message: str) -> None:
 
 
 def push_file(
+    client: MTPClient,
     config: StressTestConfig,
     local_path: Path,
     remote_name: str,
@@ -265,18 +282,46 @@ def push_file(
     stats: StressStats,
     stats_lock: threading.Lock,
     worker_id: int,
-) -> Tuple[bool, str]:
-    remote_path = posixpath.join(config.target_dir.rstrip("/\\"), remote_name)
+) -> Tuple[bool, str, bool]:
     with stats_lock:
         stats.pushes += 1
-        stats.inflight_pushes += 1
-    code, out, err = run_adb_command(config, ["push", str(local_path), remote_path], timeout=config.push_timeout)
-    if code == 0:
+    result: Dict[str, Optional[str]] = {"error": None}
+
+    def do_send() -> None:
+        try:
+            client.send_file(local_path, remote_name)
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = str(exc)
+
+    sender = threading.Thread(target=do_send)
+    sender.start()
+    sender.join(timeout=config.push_timeout)
+    if sender.is_alive():
+        error_message = "push timeout"
+        with stats_lock:
+            stats.failures += 1
+            stats.last_event = f"[线程{worker_id}] 推送超时"
+            if stats.inflight_pushes > 0:
+                stats.inflight_pushes -= 1
+        with writer_lock:
+            csv_writer.writerow(
+                record_event(
+                    "push_timeout",
+                    error_message,
+                    config,
+                    check_free_space(client),
+                    f"worker={worker_id}, path={remote_name}",
+                )
+            )
+            log_error_line(error_log, f"push_timeout: {remote_name}")
+        return False, error_message, False
+
+    if result["error"] is None:
         size = local_path.stat().st_size
         with stats_lock:
             stats.success += 1
             stats.bytes_sent += size
-            stats.last_event = f"[线程{worker_id}] 推送成功: {remote_path}"
+            stats.last_event = f"[线程{worker_id}] 推送成功: {remote_name}"
             stats.last_success_ts = time.time()
             if stats.inflight_pushes > 0:
                 stats.inflight_pushes -= 1
@@ -284,97 +329,53 @@ def push_file(
             csv_writer.writerow(
                 record_event(
                     "push_success",
-                    out,
+                    "mtp push ok",
                     config,
-                    check_free_space(config),
-                    f"worker={worker_id}, path={remote_path}",
+                    check_free_space(client),
+                    f"worker={worker_id}, path={remote_name}",
                 )
             )
-        return True, ""
-    error_message = err or out or "unknown push error"
+        return True, "", True
+
+    error_message = result["error"] or "unknown push error"
     event_label = "push_failed"
     lowered = error_message.lower()
     if "no space" in lowered:
         event_label = "push_nospace"
     elif "read-only" in lowered:
         event_label = "push_readonly"
-    elif "permission denied" in lowered:
+    elif "permission" in lowered:
         event_label = "push_permission"
-    elif "i/o error" in lowered or "ioerror" in lowered:
+    elif "i/o" in lowered or "ioerror" in lowered:
         event_label = "push_ioerror"
-    elif code == -1 or "timeout" in lowered:
-        event_label = "push_timeout"
 
     with stats_lock:
         stats.failures += 1
         stats.last_event = f"[线程{worker_id}] 推送失败: {error_message}"
+        if stats.inflight_pushes > 0:
+            stats.inflight_pushes -= 1
     with writer_lock:
         csv_writer.writerow(
             record_event(
                 event_label,
                 error_message,
                 config,
-                check_free_space(config),
-                f"worker={worker_id}, path={remote_path}",
+                check_free_space(client),
+                f"worker={worker_id}, path={remote_name}",
             )
         )
-        log_error_line(error_log, f"{event_label}: {error_message} ({remote_path})")
-    with stats_lock:
-        if stats.inflight_pushes > 0:
-            stats.inflight_pushes -= 1
-    return False, error_message
+        log_error_line(error_log, f"{event_label}: {error_message} ({remote_name})")
+    return False, error_message, not sender.is_alive()
 
 
-def detect_device(config: StressTestConfig) -> None:
-    code, out, err = run_adb_command(config, ["devices"])
-    if code != 0:
-        raise RuntimeError(f"adb not working: {err}")
-    lines = [line for line in out.splitlines() if "\tdevice" in line]
-    if not lines:
-        raise RuntimeError("未检测到可用的安卓设备 (adb devices 为空)")
-    if config.device_id:
-        if not any(line.startswith(config.device_id) for line in lines):
-            raise RuntimeError(f"Device {config.device_id} not found in adb devices list")
-    else:
-        config.device_id = lines[0].split("\t")[0]
 
 
-def ensure_device_ready(
-    config: StressTestConfig,
-    writer: csv.DictWriter,
-    writer_lock: threading.Lock,
-    error_log,
-    stats: StressStats,
-    stats_lock: threading.Lock,
-) -> bool:
-    code, out, err = run_adb_command(config, ["get-state"], timeout=10)
-    if code == 0 and out.strip() == "device":
-        return True
-    with writer_lock:
-        writer.writerow(record_event("device_retry", err or out or "device not ready", config, check_free_space(config)))
-        log_error_line(error_log, f"device_retry: {err or out}")
-    with stats_lock:
-        stats.last_event = "等待设备重新连接"
-    time.sleep(config.reconnect_delay_seconds)
-    wait_code, wait_out, wait_err = run_adb_command(config, ["wait-for-device"], timeout=120)
-    if wait_code == 0:
-        return True
-    with writer_lock:
-        writer.writerow(record_event("device_missing", wait_err or wait_out, config, check_free_space(config)))
-        log_error_line(error_log, f"device_missing: {wait_err or wait_out}")
-    return False
-
-
-def verify_remote_size(config: StressTestConfig, remote_path: str, expected_size: int) -> Tuple[bool, str]:
-    code, out, err = run_adb_command(config, ["shell", "stat", "-c", "%s", remote_path], timeout=30)
-    if code != 0:
-        return False, err or out or "stat failed"
-    try:
-        remote_size = int(out.strip())
-    except ValueError:
-        return False, f"unexpected stat output: {out}"
-    if remote_size != expected_size:
-        return False, f"size mismatch remote={remote_size} local={expected_size}"
+def verify_remote_size(client: MTPClient, remote_name: str, expected_size: int) -> Tuple[bool, str]:
+    size = client.stat_file(remote_name)
+    if size is None:
+        return False, "stat failed"
+    if size != expected_size:
+        return False, f"size mismatch remote={size} local={expected_size}"
     return True, ""
 
 
@@ -404,7 +405,9 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
 
         end_time = start_time + timedelta(hours=config.run_hours)
         stop_event = threading.Event()
-        writer.writerow(record_event("start", "测试开始", config, check_free_space(config)))
+        startup_client = MTPClient(config)
+        writer.writerow(record_event("start", "测试开始", config, check_free_space(startup_client)))
+        startup_client.close()
         ui_queue.put({"type": "status", "message": "测试已启动", "stats": stats})
 
         small_payloads = payloads[1:]
@@ -436,12 +439,14 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                 task_queue.put((None, ""))
 
         def worker(worker_id: int) -> None:
+            client: Optional[MTPClient] = None
             try:
+                client = MTPClient(config)
                 with stats_lock:
                     stats.active_workers += 1
                     stats.last_event = f"线程 {worker_id} 已启动"
                 with writer_lock:
-                    writer.writerow(record_event("worker_start", f"worker {worker_id} ready", config, check_free_space(config)))
+                    writer.writerow(record_event("worker_start", f"worker {worker_id} ready", config, check_free_space(client)))
                 ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
                 while not stop_event.is_set():
                     try:
@@ -454,7 +459,7 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                         break
 
                     try:
-                        free_space = check_free_space(config)
+                        free_space = check_free_space(client)
                         if free_space is not None and free_space < config.free_space_threshold_mb:
                             with stats_lock:
                                 stats.cleanups += 1
@@ -465,17 +470,13 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                 )
                                 log_error_line(error_log, "cleanup_needed: free space below threshold")
                             with cleanup_lock:
-                                wipe_device_storage(config, writer, writer_lock, error_log, "low_free_space")
+                                wipe_device_storage(client, config, writer, writer_lock, error_log, "low_free_space")
                             ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
                             continue
                         elif free_space is None:
                             with writer_lock:
-                                writer.writerow(record_event("free_space_unknown", "无法解析 df 输出", config, None))
-                                log_error_line(error_log, "free_space_unknown: df parse failed")
-
-                        if not ensure_device_ready(config, writer, writer_lock, error_log, stats, stats_lock):
-                            ui_queue.put({"type": "status", "message": "等待设备重连失败，稍后重试", "stats": stats})
-                            continue
+                                writer.writerow(record_event("free_space_unknown", "无法读取 MTP 空间", config, None))
+                                log_error_line(error_log, "free_space_unknown: mtp free space unavailable")
 
                         with writer_lock:
                             writer.writerow(
@@ -483,20 +484,20 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                     "push_begin",
                                     f"worker={worker_id} -> {file_name}",
                                     config,
-                                    check_free_space(config),
+                                    check_free_space(client),
                                 )
                             )
                         with stats_lock:
                             stats.last_event = f"[线程{worker_id}] 正在推送 {payload.name}"
+                            stats.inflight_pushes += 1
                         ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
 
-                        success, push_err = push_file(
-                            config, payload, file_name, writer, writer_lock, error_log, stats, stats_lock, worker_id
+                        success, push_err, client_ok = push_file(
+                            client, config, payload, file_name, writer, writer_lock, error_log, stats, stats_lock, worker_id
                         )
                         if success:
                             expected = payload.stat().st_size
-                            remote_path = posixpath.join(config.target_dir.rstrip("/\\"), file_name)
-                            ok, reason = verify_remote_size(config, remote_path, expected)
+                            ok, reason = verify_remote_size(client, file_name, expected)
                             if not ok:
                                 with stats_lock:
                                     if stats.success > 0:
@@ -509,13 +510,13 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                             "verify_failed",
                                             reason,
                                             config,
-                                            check_free_space(config),
-                                            f"worker={worker_id}, path={remote_path}",
+                                            check_free_space(client),
+                                            f"worker={worker_id}, path={file_name}",
                                         )
                                     )
-                                    log_error_line(error_log, f"verify_failed: {reason} ({remote_path})")
+                                    log_error_line(error_log, f"verify_failed: {reason} ({file_name})")
                                 with cleanup_lock:
-                                    wipe_device_storage(config, writer, writer_lock, error_log, "verify_failure")
+                                    wipe_device_storage(client, config, writer, writer_lock, error_log, "verify_failure")
                                 success = False
                             else:
                                 with writer_lock:
@@ -524,8 +525,8 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                             "verify_success",
                                             "remote size matched",
                                             config,
-                                            check_free_space(config),
-                                            f"worker={worker_id}, path={remote_path}",
+                                            check_free_space(client),
+                                            f"worker={worker_id}, path={file_name}",
                                         )
                                     )
                         if not success:
@@ -533,26 +534,35 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                                 with stats_lock:
                                     stats.last_event = "存储已满，执行全量清理"
                                 with cleanup_lock:
-                                    wipe_device_storage(config, writer, writer_lock, error_log, "no_space")
+                                    wipe_device_storage(client, config, writer, writer_lock, error_log, "no_space")
                             elif "timeout" in push_err.lower():
                                 with stats_lock:
                                     stats.last_event = "推送超时，执行全量清理并重试"
                                 with cleanup_lock:
-                                    wipe_device_storage(config, writer, writer_lock, error_log, "push_timeout")
+                                    wipe_device_storage(client, config, writer, writer_lock, error_log, "push_timeout")
+                                client_ok = False
                             else:
                                 with cleanup_lock:
-                                    cleanup_device_storage(config, writer, writer_lock, error_log, "push_failure")
+                                    cleanup_device_storage(client, config, writer, writer_lock, error_log, "push_failure")
                         ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
+                        if not client_ok:
+                            try:
+                                client.close()
+                            except Exception:
+                                pass
+                            client = MTPClient(config)
                     finally:
                         task_queue.task_done()
             except Exception as exc:  # noqa: BLE001
                 with writer_lock:
-                    writer.writerow(record_event("worker_error", str(exc), config, check_free_space(config)))
+                    writer.writerow(record_event("worker_error", str(exc), config, check_free_space(client) if client else None))
                     log_error_line(error_log, f"worker_error: {exc}")
                 with stats_lock:
                     stats.last_event = f"线程 {worker_id} 异常: {exc}"
                 ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
             finally:
+                if client:
+                    client.close()
                 with stats_lock:
                     if stats.active_workers > 0:
                         stats.active_workers -= 1
@@ -568,52 +578,58 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
 
         def monitor_health() -> None:
             last_stall_report = 0.0
-            while not stop_event.is_set():
-                # 热状况采样
-                try:
-                    temp_c, source, raw = sample_device_temperature(config)
-                    event_type = "thermal_sample"
-                    message = f"{source}: {temp_c}C" if temp_c is not None else f"{source}: unknown ({raw})"
-                    if temp_c is not None and temp_c >= config.thermal_limit_c:
-                        event_type = "thermal_high"
-                    with writer_lock:
-                        writer.writerow(record_event(event_type, message, config, check_free_space(config), raw))
-                        if event_type != "thermal_sample":
-                            log_error_line(error_log, f"{event_type}: {message}")
-                except Exception as exc:  # noqa: BLE001
-                    with writer_lock:
-                        writer.writerow(record_event("health_unknown", str(exc), config, check_free_space(config)))
-                        log_error_line(error_log, f"health_unknown: {exc}")
+            health_client: Optional[MTPClient] = None
+            try:
+                health_client = MTPClient(config)
+                while not stop_event.is_set():
+                    # 热状况采样
+                    try:
+                        temp_c, source, raw = sample_device_temperature(config)
+                        event_type = "thermal_sample"
+                        message = f"{source}: {temp_c}C" if temp_c is not None else f"{source}: unknown ({raw})"
+                        if temp_c is not None and temp_c >= config.thermal_limit_c:
+                            event_type = "thermal_high"
+                        with writer_lock:
+                            writer.writerow(record_event(event_type, message, config, check_free_space(health_client), raw))
+                            if event_type != "thermal_sample":
+                                log_error_line(error_log, f"{event_type}: {message}")
+                    except Exception as exc:  # noqa: BLE001
+                        with writer_lock:
+                            writer.writerow(record_event("health_unknown", str(exc), config, check_free_space(health_client)))
+                            log_error_line(error_log, f"health_unknown: {exc}")
 
-                # 长时间无成功推送判定为卡死/停滞
-                now_ts = time.time()
-                with stats_lock:
-                    last_ok = stats.last_success_ts
-                stall_seconds = config.stall_timeout_minutes * 60
-                if now_ts - last_ok > stall_seconds and now_ts - last_stall_report > stall_seconds:
-                    last_stall_report = now_ts
-                    with writer_lock:
-                        writer.writerow(
-                            record_event(
-                                "stall_detected",
-                                f"{config.stall_timeout_minutes}分钟无成功推送，触发全量清空以解卡",
-                                config,
-                                check_free_space(config),
-                            )
-                        )
-                        log_error_line(
-                            error_log, f"stall_detected: no success for {config.stall_timeout_minutes}分钟"
-                        )
+                    # 长时间无成功推送判定为卡死/停滞
+                    now_ts = time.time()
                     with stats_lock:
-                        stats.last_event = "检测到长时间无成功推送，执行全量清空"
-                    with cleanup_lock:
-                        wipe_device_storage(config, writer, writer_lock, error_log, "stall_detected")
-                    ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
+                        last_ok = stats.last_success_ts
+                    stall_seconds = config.stall_timeout_minutes * 60
+                    if now_ts - last_ok > stall_seconds and now_ts - last_stall_report > stall_seconds:
+                        last_stall_report = now_ts
+                        with writer_lock:
+                            writer.writerow(
+                                record_event(
+                                    "stall_detected",
+                                    f"{config.stall_timeout_minutes}分钟无成功推送，触发全量清空以解卡",
+                                    config,
+                                    check_free_space(health_client),
+                                )
+                            )
+                            log_error_line(
+                                error_log, f"stall_detected: no success for {config.stall_timeout_minutes}分钟"
+                            )
+                        with stats_lock:
+                            stats.last_event = "检测到长时间无成功推送，执行全量清空"
+                        with cleanup_lock:
+                            wipe_device_storage(health_client, config, writer, writer_lock, error_log, "stall_detected")
+                        ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
 
-                for _ in range(config.health_check_interval):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(1)
+                    for _ in range(config.health_check_interval):
+                        if stop_event.is_set():
+                            break
+                        time.sleep(1)
+            finally:
+                if health_client:
+                    health_client.close()
 
         health_thread = threading.Thread(target=monitor_health, daemon=True)
         health_thread.start()
@@ -632,7 +648,13 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
         health_thread.join(timeout=5)
 
         with writer_lock:
-            writer.writerow(record_event("complete", "测试完成", config, check_free_space(config)))
+            completion_client = None
+            try:
+                completion_client = MTPClient(config)
+                writer.writerow(record_event("complete", "测试完成", config, check_free_space(completion_client)))
+            finally:
+                if completion_client:
+                    completion_client.close()
         ui_queue.put({"type": "status", "message": "测试已完成", "stats": stats})
 
 

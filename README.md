@@ -50,10 +50,12 @@
    ```
     - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志、活跃线程数，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间），所有错误实时汇总到 `logs/storage_errors_<timestamp>.log` 便于快速定位异常。
    - 默认运行 168 小时，随机将小文件分配给多个线程并周期性插入大文件推送，持续制造并发写入；当可用空间低于 5 GB 时触发清理，MTP 传输失败或超时时会自动重建连接并清空后继续。
-   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）；也可在启动前通过环境变量快速提高并发与队列深度：
-     - `STRESS_NUM_WORKERS`：worker 线程数（默认 8，适合强调并发写入压力）
-     - `STRESS_LARGE_INTERVAL`：大文件插入间隔（默认 5，越小越频繁写入 2GB 文件）
-     - `STRESS_QUEUE_MULT`：任务队列容量系数（默认 8，队列容量 = worker * 系数）
+  - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）；也可在启动前通过环境变量快速提高并发与队列深度：
+    - `STRESS_NUM_WORKERS`：worker 线程数（默认 8，适合强调并发写入压力）
+    - `STRESS_LARGE_INTERVAL`：大文件插入间隔（默认 5，越小越频繁写入 2GB 文件）
+    - `STRESS_QUEUE_MULT`：任务队列容量系数（默认 8，队列容量 = worker * 系数）
+    - `STRESS_TARGET_DIR`：MTP 目标目录（默认 `storage_stress`，如需写到“此电脑\\CPad_8.7\\内部共享存储空间\\Download”，可设为 `Download/storage_stress` 或直接 `Download`）
+    - `STRESS_STORAGE_ID`：固定使用的 MTP 存储分区 ID（仅当设备暴露多个分区时需要，例如外置 SD 卡）
 
 ## 运行逻辑与并发策略（中文详解）
 
@@ -95,6 +97,7 @@
 ### 设备连接与重试
 
 - 启动时脚本会用 `pymtp` 连接首个 MTP 存储并创建目标目录；每个 worker 独立持有一个连接，发送异常或超时会自动重建连接后继续。
+- 若设备在连接初期未返回存储列表（`get_storage` 返回 `None`），脚本会自动视为无可用存储并提示检查 MTP 连接，避免再次出现“argument of type 'NoneType' is not iterable”类错误。
 - 若 MTP 返回错误/不可达，会记录 `device_retry`/`device_missing`，并在清理后重建目标目录再继续压测，测试不中断。
 
 ### 设备健康/卡死监测

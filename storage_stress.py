@@ -61,7 +61,7 @@ class MTPClient:
         self._pymtp = pymtp
         self.device = pymtp.MTP()
         self.device.connect()
-        storages = self.device.get_storage()
+        storages = self.device.get_storage() or []
         if not storages:
             raise RuntimeError("未检测到 MTP 存储，请检查设备是否以 MTP 模式连接")
 
@@ -90,7 +90,7 @@ class MTPClient:
         return parent_id
 
     def free_space_mb(self) -> Optional[int]:
-        storages = self.device.get_storage()
+        storages = self.device.get_storage() or []
         for st in storages:
             if st.id == self.storage_id:
                 try:
@@ -745,6 +745,8 @@ if __name__ == "__main__":
         env_workers = os.getenv("STRESS_NUM_WORKERS")
         env_interval = os.getenv("STRESS_LARGE_INTERVAL")
         env_queue_mult = os.getenv("STRESS_QUEUE_MULT")
+        env_target_dir = os.getenv("STRESS_TARGET_DIR")
+        env_storage_id = os.getenv("STRESS_STORAGE_ID")
 
         if env_workers and env_workers.isdigit():
             cfg.num_workers = max(1, int(env_workers))
@@ -752,6 +754,10 @@ if __name__ == "__main__":
             cfg.large_push_interval = max(1, int(env_interval))
         if env_queue_mult and env_queue_mult.isdigit():
             cfg.task_queue_multiplier = max(2, int(env_queue_mult))
+        if env_target_dir:
+            cfg.target_dir = env_target_dir
+        if env_storage_id and env_storage_id.isdigit():
+            cfg.mtp_storage_id = int(env_storage_id)
 
         detect_device(cfg)
         build_ui(cfg)

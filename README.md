@@ -1,11 +1,12 @@
 # 存储压力测试工具集
 
-本仓库提供两个适用于 Windows 环境、通过 `adb` 驱动的 Python 脚本，用于对安卓平板执行长时间存储压力测试，并生成本地占位文件以配合测试。主脚本支持 7×24 小时连续写入、自动清理空间、实时 CSV 落表和错误记录，便于检视平板在多次写满场景下的稳定性。
+本仓库提供两个适用于 Windows 环境、通过 `adb` 驱动的 Python 脚本，用于对安卓平板执行长时间存储压力测试，并生成本地占位文件以配合测试。主脚本支持 7×24 小时连续写入、自动清理空间、实时 CSV 落表和错误记录，并带有 Tk 图形界面显示推送进度、状态与日志，便于检视平板在多次写满场景下的稳定性。
 
 ## 文件说明
 
-- `storage_stress.py`：通过 `adb` 持续向平板指定目录推送随机大小的空白文件，记录所有操作与错误到 CSV，并在空间不足或推送失败时自动分批删除旧文件，以确保测试不中断。
-- `file_generator.py`：在本地生成任意大小（单位 MB）的空白文件，方便自定义上传载荷，或预先构造多组测试文件。
+- `storage_stress.py`：使用 `adb` 将本地预生成的 128/512/1024/2048 MB 文件循环推送到平板指定目录，记录所有操作与错误到 CSV，并在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态。
+- `file_generator.py`：一次性生成 128/512/1024/2048 MB 四个空白文件（默认输出到 `payloads/`），也可按需生成任意大小的单个文件。
+
 
 ## 环境与前置条件
 
@@ -19,19 +20,21 @@
    python -m pip install --upgrade pip
    ```
 
-2. **运行存储压力测试：**
+2. **生成预设文件（必需）：**
+   ```powershell
+   python file_generator.py --preset
+   ```
+   - 默认在 `payloads/` 目录下生成 `payload_128mb.bin`、`payload_512mb.bin`、`payload_1024mb.bin`、`payload_2048mb.bin`。
+   - 如需自定义目录，可加 `--preset-dir D:\payloads`。
+
+3. **运行存储压力测试：**
    ```powershell
    python storage_stress.py
    ```
-   - 日志会写入 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
-   - 默认运行 168 小时，每次推送 100/500/1024 MB 的文件，当可用空间低于 5 GB 时触发清理。
-   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`file_sizes_mb`、`free_space_threshold_mb`、`cleanup_batch_size` 等）。
-
-3. **生成空白文件（可选）：**
-   ```powershell
-   python file_generator.py C:\path\to\payload.bin 512
-   ```
-   上述命令会生成一个 512 MB 的空白文件。
+   - 脚本会弹出简易 GUI，显示推送成功/失败次数、累计清理次数、累计传输量以及实时事件日志，CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
+   - 默认运行 168 小时，循环推送 128/512/1024/2048 MB 四个文件，当可用空间低于 5 GB 时触发清理，并会在 `adb` 断联时自动尝试等待重连。
+   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds` 等）。
+   - 若希望生成自定义单个文件，可使用 `python file_generator.py C:\path\to\payload.bin 512`。
 
 ## 打包为 Windows 可执行文件
 

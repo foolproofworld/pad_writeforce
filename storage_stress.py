@@ -1,15 +1,15 @@
 import csv
 import os
-import random
-import shutil
-import string
+import queue
 import subprocess
 import sys
-import tempfile
+import threading
 import time
+import tkinter as tk
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -17,12 +17,23 @@ class StressTestConfig:
     device_id: Optional[str] = None
     target_dir: str = "/sdcard/storage_stress"
     local_log_dir: str = "logs"
-    file_sizes_mb: List[int] = field(default_factory=lambda: [100, 500, 1024])
+    payload_dir: Path = Path("payloads")
     free_space_threshold_mb: int = 5_000
     run_hours: int = 24 * 7
     push_timeout: int = 600
     poll_interval_seconds: int = 5
     cleanup_batch_size: int = 5
+    reconnect_delay_seconds: int = 10
+
+
+@dataclass
+class StressStats:
+    pushes: int = 0
+    success: int = 0
+    failures: int = 0
+    cleanups: int = 0
+    bytes_sent: int = 0
+    last_event: str = ""
 
 
 def adb_base_args(device_id: Optional[str]) -> List[str]:
@@ -51,6 +62,15 @@ def ensure_target_dir(config: StressTestConfig) -> None:
 
 def ensure_local_logs(config: StressTestConfig) -> None:
     os.makedirs(config.local_log_dir, exist_ok=True)
+
+
+def load_payloads(config: StressTestConfig) -> List[Path]:
+    expected = [config.payload_dir / f"payload_{size}mb.bin" for size in [128, 512, 1024, 2048]]
+    missing = [path for path in expected if not path.exists()]
+    if missing:
+        joined = ", ".join(str(p) for p in missing)
+        raise RuntimeError(f"缺少预置文件: {joined}")
+    return expected
 
 
 def list_device_files(config: StressTestConfig) -> List[str]:
@@ -114,22 +134,18 @@ def record_event(event_type: str, message: str, config: StressTestConfig, free_s
     }
 
 
-def generate_temp_file(size_mb: int) -> str:
-    fd, path = tempfile.mkstemp(suffix=".bin")
-    os.close(fd)
-    with open(path, "wb") as handle:
-        handle.truncate(size_mb * 1024 * 1024)
-    return path
-
-
-def push_file(config: StressTestConfig, local_path: str, remote_name: str, csv_writer: csv.DictWriter) -> bool:
+def push_file(config: StressTestConfig, local_path: Path, remote_name: str, csv_writer: csv.DictWriter, stats: StressStats) -> bool:
     remote_path = os.path.join(config.target_dir, remote_name)
-    code, out, err = run_adb_command(
-        config, ["push", local_path, remote_path], timeout=config.push_timeout
-    )
+    code, out, err = run_adb_command(config, ["push", str(local_path), remote_path], timeout=config.push_timeout)
+    stats.pushes += 1
     if code == 0:
+        stats.success += 1
+        stats.bytes_sent += local_path.stat().st_size
+        stats.last_event = f"推送成功: {remote_path}"
         csv_writer.writerow(record_event("push_success", out, config, check_free_space(config), remote_path))
         return True
+    stats.failures += 1
+    stats.last_event = f"推送失败: {err or out}"
     csv_writer.writerow(record_event("push_failed", err or out, config, check_free_space(config), remote_path))
     return False
 
@@ -140,7 +156,7 @@ def detect_device(config: StressTestConfig) -> None:
         raise RuntimeError(f"adb not working: {err}")
     lines = [line for line in out.splitlines() if "\tdevice" in line]
     if not lines:
-        raise RuntimeError("No Android devices detected via adb")
+        raise RuntimeError("未检测到可用的安卓设备 (adb devices 为空)")
     if config.device_id:
         if not any(line.startswith(config.device_id) for line in lines):
             raise RuntimeError(f"Device {config.device_id} not found in adb devices list")
@@ -148,9 +164,25 @@ def detect_device(config: StressTestConfig) -> None:
         config.device_id = lines[0].split("\t")[0]
 
 
-def run_stress_test(config: StressTestConfig) -> None:
+def ensure_device_ready(config: StressTestConfig, writer: csv.DictWriter, stats: StressStats) -> bool:
+    code, out, err = run_adb_command(config, ["get-state"], timeout=10)
+    if code == 0 and out.strip() == "device":
+        return True
+    writer.writerow(record_event("device_retry", err or out or "device not ready", config, check_free_space(config)))
+    stats.last_event = "等待设备重新连接"
+    time.sleep(config.reconnect_delay_seconds)
+    wait_code, wait_out, wait_err = run_adb_command(config, ["wait-for-device"], timeout=120)
+    if wait_code == 0:
+        return True
+    writer.writerow(record_event("device_missing", wait_err or wait_out, config, check_free_space(config)))
+    return False
+
+
+def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue) -> None:
     ensure_local_logs(config)
+    payloads = load_payloads(config)
     ensure_target_dir(config)
+    stats = StressStats()
     log_path = os.path.join(config.local_log_dir, f"storage_stress_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
 
     with open(log_path, "w", newline="", encoding="utf-8") as csvfile:
@@ -159,37 +191,89 @@ def run_stress_test(config: StressTestConfig) -> None:
         writer.writeheader()
 
         end_time = datetime.utcnow() + timedelta(hours=config.run_hours)
-        writer.writerow(record_event("start", "test started", config, check_free_space(config)))
+        writer.writerow(record_event("start", "测试开始", config, check_free_space(config)))
+        ui_queue.put({"type": "status", "message": "测试已启动", "stats": stats})
 
+        payload_index = 0
         while datetime.utcnow() < end_time:
             free_space = check_free_space(config)
             if free_space is not None and free_space < config.free_space_threshold_mb:
-                writer.writerow(record_event("cleanup_needed", "free space below threshold", config, free_space))
+                writer.writerow(record_event("cleanup_needed", "剩余空间低于阈值，开始清理", config, free_space))
+                stats.cleanups += 1
                 cleanup_device_storage(config, writer, "low_free_space")
+                ui_queue.put({"type": "status", "message": "正在清理旧文件", "stats": stats})
                 time.sleep(config.poll_interval_seconds)
                 continue
 
-            size_mb = random.choice(config.file_sizes_mb)
-            temp_path = generate_temp_file(size_mb)
-            file_name = datetime.utcnow().strftime("%Y%m%d_%H%M%S") + "_" + "".join(random.choices(string.ascii_lowercase, k=6)) + ".bin"
+            if not ensure_device_ready(config, writer, stats):
+                ui_queue.put({"type": "status", "message": "等待设备重连失败，稍后重试", "stats": stats})
+                time.sleep(config.reconnect_delay_seconds)
+                continue
 
-            try:
-                success = push_file(config, temp_path, file_name, writer)
-                if not success:
-                    cleanup_device_storage(config, writer, "push_failure")
-            finally:
-                os.remove(temp_path)
+            payload = payloads[payload_index % len(payloads)]
+            payload_index += 1
+            file_name = datetime.utcnow().strftime("%Y%m%d_%H%M%S") + "_" + payload.name
 
+            success = push_file(config, payload, file_name, writer, stats)
+            if not success:
+                cleanup_device_storage(config, writer, "push_failure")
+            ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
             time.sleep(config.poll_interval_seconds)
 
-        writer.writerow(record_event("complete", "test finished", config, check_free_space(config)))
+        writer.writerow(record_event("complete", "测试完成", config, check_free_space(config)))
+        ui_queue.put({"type": "status", "message": "测试已完成", "stats": stats})
+
+
+def build_ui(config: StressTestConfig) -> None:
+    ui_queue: queue.Queue = queue.Queue()
+
+    root = tk.Tk()
+    root.title("存储压力测试监控")
+    root.geometry("520x320")
+
+    status_var = tk.StringVar(value="等待开始...")
+    progress_var = tk.StringVar(value="已推送 0/0 成功/失败")
+    cleanup_var = tk.StringVar(value="清理次数: 0")
+    bytes_var = tk.StringVar(value="累计传输: 0 MB")
+
+    tk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", padx=10, pady=5)
+    tk.Label(root, textvariable=progress_var, anchor="w").pack(fill="x", padx=10, pady=5)
+    tk.Label(root, textvariable=cleanup_var, anchor="w").pack(fill="x", padx=10, pady=5)
+    tk.Label(root, textvariable=bytes_var, anchor="w").pack(fill="x", padx=10, pady=5)
+
+    log_box = tk.Text(root, height=10)
+    log_box.pack(fill="both", expand=True, padx=10, pady=5)
+    log_box.configure(state="disabled")
+
+    def update_ui() -> None:
+        try:
+            while True:
+                event = ui_queue.get_nowait()
+                stats: StressStats = event.get("stats", StressStats())
+                status_var.set(event.get("message", ""))
+                progress_var.set(f"推送: {stats.success} 成功 / {stats.failures} 失败 (总尝试 {stats.pushes})")
+                cleanup_var.set(f"清理次数: {stats.cleanups}")
+                bytes_var.set(f"累计传输: {stats.bytes_sent // 1024 // 1024} MB")
+
+                log_box.configure(state="normal")
+                log_box.insert("end", f"{datetime.utcnow().strftime('%H:%M:%S')} - {event.get('message','')}\n")
+                log_box.see("end")
+                log_box.configure(state="disabled")
+        except queue.Empty:
+            pass
+        root.after(500, update_ui)
+
+    worker = threading.Thread(target=run_stress_test, args=(config, ui_queue), daemon=True)
+    worker.start()
+    root.after(500, update_ui)
+    root.mainloop()
 
 
 if __name__ == "__main__":
     try:
         cfg = StressTestConfig()
         detect_device(cfg)
-        run_stress_test(cfg)
+        build_ui(cfg)
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"Fatal error: {exc}\n")
         sys.exit(1)

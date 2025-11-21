@@ -8,6 +8,7 @@
 import argparse
 import csv
 import importlib
+import importlib.util as importlib_util
 import queue
 import sys
 import threading
@@ -63,9 +64,22 @@ class MTPSession:
     """对 pymtp 的薄封装，提供路径创建、推送、清理能力。"""
 
     def __init__(self, config: StressTestConfig):
-        if importlib.util.find_spec("pymtp") is None:
+        try:
+            find_spec = importlib_util.find_spec
+        except AttributeError:
+            raise RuntimeError(
+                "标准库 importlib.util 不可用，可能被第三方同名包覆盖，请卸载 pip 包 `importlib` 再重试"
+            )
+
+        if find_spec("pymtp") is None:
             raise RuntimeError("缺少依赖 pymtp，请先执行: pip install pymtp")
-        self._pymtp = importlib.import_module("pymtp")
+
+        try:
+            self._pymtp = importlib.import_module("pymtp")
+        except AttributeError:
+            raise RuntimeError(
+                "内置 importlib 被第三方覆盖，导致 import_module 不可用；请移除 pip 包 `importlib` 或重建虚拟环境"
+            )
         self.config = config
         self.device = self._pymtp.MTP()
         self.storage_id: Optional[int] = None
@@ -166,6 +180,21 @@ class MTPSession:
 
 # ----------------------------- 日志与事件 -----------------------------
 
+class EventLogger:
+    def __init__(self, log_dir: Path):
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        self.events_path = self.log_dir / f"storage_stress_{ts}.csv"
+        self.error_path = self.log_dir / f"storage_errors_{ts}.log"
+        self.summary_path = self.log_dir / f"storage_summary_{ts}.txt"
+        self._event_file = self.events_path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(
+            self._event_file, fieldnames=["timestamp", "event", "message", "free_space_mb", "extra"]
+        )
+        self._writer.writeheader()
+        self._lock = threading.Lock()
+        self._error_file = self.error_path.open("w", encoding="utf-8")
 
 def record_event(event: str, message: str, free_space: Optional[int], extra: Optional[str] = None) -> Dict[str, str]:
     return {
@@ -176,6 +205,11 @@ def record_event(event: str, message: str, free_space: Optional[int], extra: Opt
         "extra": extra or "",
     }
 
+    def log_error(self, message: str) -> None:
+        line = f"{datetime.utcnow().isoformat()} | {message}\n"
+        with self._lock:
+            self._error_file.write(line)
+            self._error_file.flush()
 
 class EventLogger:
     def __init__(self, log_dir: Path):

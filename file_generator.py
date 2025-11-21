@@ -24,9 +24,16 @@ def generate_small_files(output_dir: Path, count: int = 1_000, size_kb: int = 10
     size_bytes = size_kb * 1024
     output_dir.mkdir(parents=True, exist_ok=True)
     for idx in range(1, count + 1):
-        filename = f"doc_{idx:04d}.dat"
+        filename = f"doc_{idx:04d}.txt"
         path = output_dir / filename
-        generate_blank_file(path, size_bytes)
+        filler = ("文档填充内容，仅用于存储压力测试。" * 50 + "\n").encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            written = 0
+            while written < size_bytes:
+                chunk = filler[: min(len(filler), size_bytes - written)]
+                handle.write(chunk)
+                written += len(chunk)
         generated.append(path)
     return generated
 

@@ -4,8 +4,8 @@
 
 ## 文件说明
 
-- `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 小文件，记录所有操作与错误到 CSV，并在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态。
-- `file_generator.py`：一键在桌面生成上述 `pad_test.iso` 和 1000 个 100KB 小文件（默认目录 `~/Desktop/pad_small_files`），参数可自定义路径、数量与大小。
+- `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），记录所有操作与错误到 CSV，并在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态。
+- `file_generator.py`：一键在桌面生成上述 `pad_test.iso` 和 1000 个 100KB 文档（默认目录 `~/Desktop/pad_small_files`，命名为 `doc_XXXX.txt`），参数可自定义路径、数量与大小。
 
 ## 环境与前置条件
 
@@ -23,7 +23,7 @@
    ```powershell
    python file_generator.py
    ```
-   - 默认会在桌面生成 `pad_test.iso`（约 2GB，占位视频或压缩包）以及 `pad_small_files/` 下的 1000 个 100KB 文档。
+   - 默认会在桌面生成 `pad_test.iso`（约 2GB，占位视频或压缩包）以及 `pad_small_files/` 下的 1000 个 100KB 文档（`.txt`，包含重复文字内容方便识别）。
    - 如需只生成某一类或调整路径，可用：
      - 仅生成大文件：`python file_generator.py --mode iso --iso-path D:\pad_test.iso --iso-size-gb 2`
      - 仅生成小文件包：`python file_generator.py --mode small --small-dir D:\pad_small_files --small-count 1000 --small-size-kb 100`

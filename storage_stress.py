@@ -1,5 +1,6 @@
 import csv
 import os
+import posixpath
 import queue
 import subprocess
 import sys
@@ -70,10 +71,10 @@ def load_payloads(config: StressTestConfig) -> List[Path]:
     if not config.large_payload.exists():
         raise RuntimeError(f"缺少大文件: {config.large_payload}")
 
-    small_files = sorted(config.small_payload_dir.glob("doc_*.dat"))
+    small_files = sorted(config.small_payload_dir.glob("doc_*.txt"))
     if not small_files:
         raise RuntimeError(
-            f"未找到小文件包，请在 {config.small_payload_dir} 下生成 doc_*.dat"
+            f"未找到小文件包，请在 {config.small_payload_dir} 下生成 doc_*.txt"
         )
 
     return [config.large_payload] + small_files
@@ -155,7 +156,7 @@ def push_file(
     stats_lock: threading.Lock,
     worker_id: int,
 ) -> bool:
-    remote_path = os.path.join(config.target_dir, remote_name)
+    remote_path = posixpath.join(config.target_dir.rstrip("/\\"), remote_name)
     code, out, err = run_adb_command(config, ["push", str(local_path), remote_path], timeout=config.push_timeout)
     with stats_lock:
         stats.pushes += 1

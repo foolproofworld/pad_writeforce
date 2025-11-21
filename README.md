@@ -18,7 +18,7 @@
 
 ## 文件说明
 
-- `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），小文件随机分配到多个线程以模拟多文件同步，并按设定的间隔强制插入大文件写入；每次推送后会通过远端 `stat` 校验文件尺寸，记录所有操作与错误到 CSV，在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态与累计运行时间进度条。
+- `storage_stress.py`：多线程循环推送桌面上的大文件 `pad_test.iso`（默认 2GB 视频/压缩包占位文件）和 1000 个 100KB 文档（`.txt`），小文件随机分配到多个线程以模拟多文件同步，并按设定的间隔强制插入大文件写入；默认目标目录写死为 **内部共享存储空间的 `Download`**，每次推送后会通过远端 `stat` 校验文件尺寸，记录所有操作与错误到 CSV，在空间不足或推送失败时自动分批删除旧文件，辅以图形化界面展示实时状态与累计运行时间进度条。
 - `file_generator.py`：一键在桌面生成上述 `pad_test.iso` 和 1000 个 100KB 文档（默认目录 `~/Desktop/pad_small_files`，命名为 `doc_XXXX.txt`），参数可自定义路径、数量与大小。
 - 额外加入温度/卡死监测：定期采样 thermal/battery 温度，高于阈值或长时间无成功推送时自动全量清空并落表，以暴露更多潜在异常。
 
@@ -50,12 +50,14 @@
    ```
     - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志、活跃线程数，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间），所有错误实时汇总到 `logs/storage_errors_<timestamp>.log` 便于快速定位异常。
    - 默认运行 168 小时，随机将小文件分配给多个线程并周期性插入大文件推送，持续制造并发写入；当可用空间低于 5 GB 时触发清理，MTP 传输失败或超时时会自动重建连接并清空后继续。
-  - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）；也可在启动前通过环境变量快速提高并发与队列深度：
-    - `STRESS_NUM_WORKERS`：worker 线程数（默认 8，适合强调并发写入压力）
-    - `STRESS_LARGE_INTERVAL`：大文件插入间隔（默认 5，越小越频繁写入 2GB 文件）
+   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）；默认已将目标目录写死为内部存储的 `Download`，无需再额外指定路径，若设备的下载目录名称不同，可在启动前通过环境变量覆盖并发或目标目录：
+     - `STRESS_NUM_WORKERS`：worker 线程数（默认 8，适合强调并发写入压力）
+     - `STRESS_LARGE_INTERVAL`：大文件插入间隔（默认 5，越小越频繁写入 2GB 文件）
     - `STRESS_QUEUE_MULT`：任务队列容量系数（默认 8，队列容量 = worker * 系数）
-    - `STRESS_TARGET_DIR`：MTP 目标目录（默认 `storage_stress`，如需写到“此电脑\\CPad_8.7\\内部共享存储空间\\Download”，可设为 `Download/storage_stress` 或直接 `Download`）
+    - `STRESS_TARGET_DIR`：覆盖目标目录名称（默认写死为 `Download`，用于“此电脑\\CPad_8.7\\内部共享存储空间\\Download”）。
     - `STRESS_STORAGE_ID`：固定使用的 MTP 存储分区 ID（仅当设备暴露多个分区时需要，例如外置 SD 卡）
+
+    > 说明：脚本会优先选择描述/卷标包含 “CPad”/“内部共享存储空间”/“Internal shared storage” 的存储分区并将目录写死到 `Download`，因此一般情况下无需再指定路径；仅当设备枚举出多个分区或目录名称不同，才需要设置上述两个环境变量。
 
 ## 运行逻辑与并发策略（中文详解）
 

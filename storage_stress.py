@@ -18,7 +18,8 @@ from typing import Dict, List, Optional, Tuple
 class StressTestConfig:
     device_id: Optional[str] = None
     mtp_storage_id: Optional[int] = None
-    target_dir: str = "storage_stress"
+    # 按用户提供的路径写死为内部共享存储的 Download 目录
+    target_dir: str = "Download"
     local_log_dir: str = "logs"
     large_payload: Path = Path.home() / "Desktop" / "pad_test.iso"
     small_payload_dir: Path = Path.home() / "Desktop" / "pad_small_files"
@@ -65,13 +66,24 @@ class MTPClient:
         if not storages:
             raise RuntimeError("未检测到 MTP 存储，请检查设备是否以 MTP 模式连接")
 
-        if config.mtp_storage_id:
-            target_storage = next((s for s in storages if s.id == config.mtp_storage_id), storages[0])
-        else:
-            target_storage = storages[0]
+        target_storage = self._select_storage(storages, config)
         self.storage_id = target_storage.id
         self.device.set_default_storage(self.storage_id)
         self.target_folder_id = self.ensure_folder_path(config.target_dir)
+
+    def _select_storage(self, storages, config: StressTestConfig):
+        if config.mtp_storage_id:
+            return next((s for s in storages if s.id == config.mtp_storage_id), storages[0])
+
+        # 优先匹配“CPad_8.7 / 内部共享存储空间”这类描述，缺省再回落首个存储
+        keywords = ["cpad", "内部共享存储", "internal", "shared"]
+        for st in storages:
+            desc = getattr(st, "description", "") or ""
+            name = getattr(st, "volume_label", "") or ""
+            label = f"{desc} {name}".lower()
+            if any(k in label for k in keywords):
+                return st
+        return storages[0]
 
     def ensure_folder_path(self, path: str) -> int:
         segments = [seg for seg in path.replace("\\", "/").split("/") if seg]

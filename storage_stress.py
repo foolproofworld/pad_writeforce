@@ -180,6 +180,21 @@ class MTPSession:
 
 # ----------------------------- 日志与事件 -----------------------------
 
+class EventLogger:
+    def __init__(self, log_dir: Path):
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        self.events_path = self.log_dir / f"storage_stress_{ts}.csv"
+        self.error_path = self.log_dir / f"storage_errors_{ts}.log"
+        self.summary_path = self.log_dir / f"storage_summary_{ts}.txt"
+        self._event_file = self.events_path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(
+            self._event_file, fieldnames=["timestamp", "event", "message", "free_space_mb", "extra"]
+        )
+        self._writer.writeheader()
+        self._lock = threading.Lock()
+        self._error_file = self.error_path.open("w", encoding="utf-8")
 
 def record_event(event: str, message: str, free_space: Optional[int], extra: Optional[str] = None) -> Dict[str, str]:
     return {
@@ -190,6 +205,11 @@ def record_event(event: str, message: str, free_space: Optional[int], extra: Opt
         "extra": extra or "",
     }
 
+    def log_error(self, message: str) -> None:
+        line = f"{datetime.utcnow().isoformat()} | {message}\n"
+        with self._lock:
+            self._error_file.write(line)
+            self._error_file.flush()
 
 class EventLogger:
     def __init__(self, log_dir: Path):

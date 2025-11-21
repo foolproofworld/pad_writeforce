@@ -62,7 +62,12 @@ class MTPClient:
         self._pymtp = pymtp
         self.device = pymtp.MTP()
         self.device.connect()
-        storages = self.device.get_storage() or []
+        try:
+            storages = self.device.get_storage() or []
+        except TypeError as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "设备未正确以 MTP 枚举（get_storage 返回 None），请检查数据线/驱动后重试"
+            ) from exc
         if not storages:
             raise RuntimeError("未检测到 MTP 存储，请检查设备是否以 MTP 模式连接")
 

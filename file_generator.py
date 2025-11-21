@@ -59,6 +59,7 @@ def main() -> None:
     if args.destination is None or args.size is None:
         raise SystemExit("必须提供文件路径和大小，或者使用 --preset 生成预设文件")
 
+
     generate_blank_file(args.destination, args.size)
     print(f"Generated {args.destination} ({args.size} MB)")
 

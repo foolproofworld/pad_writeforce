@@ -33,18 +33,24 @@
    ```powershell
    python storage_stress.py
    ```
-   - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
+   - 脚本会弹出简易 GUI，显示多线程推送成功/失败次数、累计清理次数、累计传输量、实时事件日志、活跃线程数，以及累计运行时长进度条（按配置的运行时长 100% 累进）。CSV 落表路径为 `logs/storage_stress_<timestamp>.csv`（UTC 时间）。
    - 默认运行 168 小时，随机将小文件分配给多个线程并周期性插入大文件推送，持续制造并发写入；当可用空间低于 5 GB 时触发清理，并会在 `adb` 断联时自动尝试等待重连。
-   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）。
+   - 可在 `storage_stress.py` 的 `StressTestConfig` 中调整参数（如 `target_dir`、`free_space_threshold_mb`、`cleanup_batch_size`、`reconnect_delay_seconds`、`num_workers` 等）；也可在启动前通过环境变量快速提高并发与队列深度：
+     - `STRESS_NUM_WORKERS`：worker 线程数（默认 8，适合强调并发写入压力）
+     - `STRESS_LARGE_INTERVAL`：大文件插入间隔（默认 5，越小越频繁写入 2GB 文件）
+     - `STRESS_QUEUE_MULT`：任务队列容量系数（默认 8，队列容量 = worker * 系数）
 
 ## 运行逻辑与并发策略（中文详解）
 
 ### 推送顺序与并发模型
 
-- 默认启动 3 个 worker 线程（`num_workers` 可调），每个线程独立循环执行：检测剩余空间→确保设备在线→选择下一份 payload→推送→视结果做校验或清理→休眠 `poll_interval_seconds` 秒。
-- Payload 队列在内存中共享：
-  - 大文件 `pad_test.iso` 作为「强制插入」任务，间隔由 `large_push_interval` 控制（默认 10 次小文件后强插 1 次），保证大文件在长跑中持续出现，而不是等小文件跑完才推送。
-  - 小文件从 `doc_*.txt` 列表中随机抽取，多个线程并行抽样，天然打乱顺序，符合「多文件同时传输」的同步场景模拟。
+- 默认启动 8 个 worker 线程（`num_workers` 可调，亦可用环境变量设置）**再加 1 个 producer 线程**负责持续填充任务队列：
+  - producer 以 `large_push_interval` 为节奏强插大文件，空档随机抽取小文件，并为每个任务生成独立时间戳/队列深度前缀，确保大文件在长跑中穿插出现。
+  - worker 线程从队列中并行抢占任务，独立执行：检测剩余空间→确保设备在线→落表 `push_begin`→推送→校验/清理→回写状态，无需等待其他线程完成，真正并行传输。
+- 并发可视化：
+  - GUI 增加 “并行中的推送” 计数（`inflight_pushes`）和活跃线程数，可直观看到是否存在多条推送同时执行。
+  - CSV/GUI 的 `worker_start`、`push_begin`、`push_success`/`push_failed` 时间戳可交叉验证同一时间窗口是否有传输重叠。
+- 任务队列容量为 `num_workers * task_queue_multiplier`（默认系数 8），既保证随时有任务可抢，又避免一次性排太多旧时间戳的文件名；必要时可用 `STRESS_QUEUE_MULT` 提升排队深度，扩大瞬时并行机会。
 
 ### 成功判定与校验机制
 
@@ -117,4 +123,4 @@ pyinstaller --onefile file_generator.py
 - CSV 日志包含每次推送、清理与错误信息，并记录远端尺寸校验是否通过，可实时导入 Excel/BI 做监控；字段包括时间戳、事件类型、消息、剩余空间与附加信息。
 - 当空间不足或推送失败提示磁盘写满时，会整目录清空后重建；其他错误仍按小批量删除最新文件释放空间，确保多线程不会互相踩踏并能继续运行。
 - 建议在 CSV 中按 `event` 字段筛选（如 `push_timeout`、`push_nospace`、`thermal_high`、`stall_detected`），可快速定位错误来源、复盘是否与过热/卡死/空间不足相关。
-- 如设备 I/O 较慢，可适当增大 `poll_interval_seconds`，或调低 `num_workers` 以降低瞬时压力；若希望更猛的并发可增大 `num_workers`。
+- 如设备 I/O 较慢，可适当增大 `poll_interval_seconds`，或调低 `num_workers` 以降低瞬时压力；若希望更猛的并发可增大 `num_workers`、`task_queue_multiplier`，并缩小 `large_push_interval`（或通过环境变量设置）。

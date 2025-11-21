@@ -25,14 +25,15 @@ class StressTestConfig:
     free_space_threshold_mb: int = 5_000
     run_hours: int = 24 * 7
     push_timeout: int = 600
-    poll_interval_seconds: int = 5
+    poll_interval_seconds: int = 1
     cleanup_batch_size: int = 5
     reconnect_delay_seconds: int = 10
-    num_workers: int = 3
-    large_push_interval: int = 10
+    num_workers: int = 8
+    large_push_interval: int = 5
     health_check_interval: int = 60
     thermal_limit_c: int = 65
     stall_timeout_minutes: int = 10
+    task_queue_multiplier: int = 8
 
 
 @dataclass
@@ -44,6 +45,8 @@ class StressStats:
     bytes_sent: int = 0
     last_event: str = ""
     last_success_ts: float = 0.0
+    active_workers: int = 0
+    inflight_pushes: int = 0
 
 
 def adb_base_args(device_id: Optional[str]) -> List[str]:
@@ -167,15 +170,28 @@ def check_free_space(config: StressTestConfig) -> Optional[int]:
             config.target_dir,
             "/sdcard",
             "/storage/emulated/0",
+            "/data",
         ],
     )
     if code != 0:
         return None
 
-    for mount in (config.target_dir, "/sdcard", "/storage/emulated/0"):
+    for mount in (config.target_dir, "/sdcard", "/storage/emulated/0", "/data"):
         value = parse_free_space_mb(out, mount)
         if value is not None:
             return value
+
+    # 回退: 使用 stat -f 解析 bavail
+    s_code, s_out, _ = run_adb_command(
+        config,
+        ["shell", "stat", "-f", "-c", "%a %S", config.target_dir],
+    )
+    if s_code == 0:
+        try:
+            avail_blocks, block_size = s_out.split()
+            return (int(avail_blocks) * int(block_size)) // (1024 * 1024)
+        except Exception:  # noqa: BLE001
+            return None
     return None
 
 
@@ -245,6 +261,7 @@ def push_file(
     code, out, err = run_adb_command(config, ["push", str(local_path), remote_path], timeout=config.push_timeout)
     with stats_lock:
         stats.pushes += 1
+        stats.inflight_pushes += 1
     if code == 0:
         size = local_path.stat().st_size
         with stats_lock:
@@ -252,6 +269,8 @@ def push_file(
             stats.bytes_sent += size
             stats.last_event = f"[线程{worker_id}] 推送成功: {remote_path}"
             stats.last_success_ts = time.time()
+            if stats.inflight_pushes > 0:
+                stats.inflight_pushes -= 1
         with writer_lock:
             csv_writer.writerow(
                 record_event(
@@ -290,6 +309,9 @@ def push_file(
                 f"worker={worker_id}, path={remote_path}",
             )
         )
+    with stats_lock:
+        if stats.inflight_pushes > 0:
+            stats.inflight_pushes -= 1
     return False, error_message
 
 
@@ -353,6 +375,9 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
     writer_lock = threading.Lock()
     cleanup_lock = threading.Lock()
     payload_lock = threading.Lock()
+    task_queue: queue.Queue[Tuple[Optional[Path], str]] = queue.Queue(
+        maxsize=max(2, config.num_workers * config.task_queue_multiplier)
+    )
 
     log_path = os.path.join(config.local_log_dir, f"storage_stress_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
 
@@ -370,105 +395,148 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
         large_payload = payloads[0]
         pushes_since_large = config.large_push_interval
 
-        def next_payload() -> Path:
+        def producer() -> None:
             nonlocal pushes_since_large
-            with payload_lock:
-                if pushes_since_large >= config.large_push_interval:
-                    pushes_since_large = 0
-                    return large_payload
-                pushes_since_large += 1
-            return choice(small_payloads)
+            while True:
+                if stop_event.is_set():
+                    break
+                if datetime.utcnow() >= end_time:
+                    stop_event.set()
+                    break
+                if task_queue.full():
+                    time.sleep(0.05)
+                    continue
+                with payload_lock:
+                    if pushes_since_large >= config.large_push_interval:
+                        payload = large_payload
+                        pushes_since_large = 0
+                    else:
+                        payload = choice(small_payloads)
+                        pushes_since_large += 1
+                remote_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_q{task_queue.qsize()}_{payload.name}"
+                task_queue.put((payload, remote_name))
+            # 结束时给每个 worker 一个停止标识
+            for _ in range(config.num_workers):
+                task_queue.put((None, ""))
 
         def worker(worker_id: int) -> None:
             try:
+                with stats_lock:
+                    stats.active_workers += 1
+                    stats.last_event = f"线程 {worker_id} 已启动"
+                with writer_lock:
+                    writer.writerow(record_event("worker_start", f"worker {worker_id} ready", config, check_free_space(config)))
+                ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
                 while not stop_event.is_set():
-                    if datetime.utcnow() >= end_time:
-                        stop_event.set()
+                    try:
+                        payload, file_name = task_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+
+                    if payload is None:
+                        task_queue.task_done()
                         break
 
-                    free_space = check_free_space(config)
-                    if free_space is not None and free_space < config.free_space_threshold_mb:
-                        with stats_lock:
-                            stats.cleanups += 1
-                            stats.last_event = "剩余空间不足，执行全量清理"
+                    try:
+                        free_space = check_free_space(config)
+                        if free_space is not None and free_space < config.free_space_threshold_mb:
+                            with stats_lock:
+                                stats.cleanups += 1
+                                stats.last_event = "剩余空间不足，执行全量清理"
+                            with writer_lock:
+                                writer.writerow(
+                                    record_event("cleanup_needed", "剩余空间低于阈值，执行全量清空", config, free_space)
+                                )
+                            with cleanup_lock:
+                                wipe_device_storage(config, writer, writer_lock, "low_free_space")
+                            ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
+                            continue
+                        elif free_space is None:
+                            with writer_lock:
+                                writer.writerow(record_event("free_space_unknown", "无法解析 df 输出", config, None))
+
+                        if not ensure_device_ready(config, writer, writer_lock, stats, stats_lock):
+                            ui_queue.put({"type": "status", "message": "等待设备重连失败，稍后重试", "stats": stats})
+                            continue
+
                         with writer_lock:
                             writer.writerow(
-                                record_event("cleanup_needed", "剩余空间低于阈值，执行全量清空", config, free_space)
+                                record_event(
+                                    "push_begin",
+                                    f"worker={worker_id} -> {file_name}",
+                                    config,
+                                    check_free_space(config),
+                                )
                             )
-                        with cleanup_lock:
-                            wipe_device_storage(config, writer, writer_lock, "low_free_space")
+                        with stats_lock:
+                            stats.last_event = f"[线程{worker_id}] 正在推送 {payload.name}"
                         ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
-                        time.sleep(config.poll_interval_seconds)
-                        continue
-                    elif free_space is None:
-                        with writer_lock:
-                            writer.writerow(record_event("free_space_unknown", "无法解析 df 输出", config, None))
 
-                    if not ensure_device_ready(config, writer, writer_lock, stats, stats_lock):
-                        ui_queue.put({"type": "status", "message": "等待设备重连失败，稍后重试", "stats": stats})
-                        time.sleep(config.reconnect_delay_seconds)
-                        continue
-
-                    payload = next_payload()
-                    file_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_w{worker_id}_{payload.name}"
-
-                    success, push_err = push_file(config, payload, file_name, writer, writer_lock, stats, stats_lock, worker_id)
-                    if success:
-                        expected = payload.stat().st_size
-                        remote_path = posixpath.join(config.target_dir.rstrip("/\\"), file_name)
-                        ok, reason = verify_remote_size(config, remote_path, expected)
-                        if not ok:
-                            with stats_lock:
-                                if stats.success > 0:
-                                    stats.success -= 1
-                                stats.failures += 1
-                                stats.last_event = f"[线程{worker_id}] 校验失败: {reason}"
-                            with writer_lock:
-                                writer.writerow(
-                                    record_event(
-                                        "verify_failed",
-                                        reason,
-                                        config,
-                                        check_free_space(config),
-                                        f"worker={worker_id}, path={remote_path}",
+                        success, push_err = push_file(config, payload, file_name, writer, writer_lock, stats, stats_lock, worker_id)
+                        if success:
+                            expected = payload.stat().st_size
+                            remote_path = posixpath.join(config.target_dir.rstrip("/\\"), file_name)
+                            ok, reason = verify_remote_size(config, remote_path, expected)
+                            if not ok:
+                                with stats_lock:
+                                    if stats.success > 0:
+                                        stats.success -= 1
+                                    stats.failures += 1
+                                    stats.last_event = f"[线程{worker_id}] 校验失败: {reason}"
+                                with writer_lock:
+                                    writer.writerow(
+                                        record_event(
+                                            "verify_failed",
+                                            reason,
+                                            config,
+                                            check_free_space(config),
+                                            f"worker={worker_id}, path={remote_path}",
+                                        )
                                     )
-                                )
-                            with cleanup_lock:
-                                wipe_device_storage(config, writer, writer_lock, "verify_failure")
-                            success = False
-                        else:
-                            with writer_lock:
-                                writer.writerow(
-                                    record_event(
-                                        "verify_success",
-                                        "remote size matched",
-                                        config,
-                                        check_free_space(config),
-                                        f"worker={worker_id}, path={remote_path}",
+                                with cleanup_lock:
+                                    wipe_device_storage(config, writer, writer_lock, "verify_failure")
+                                success = False
+                            else:
+                                with writer_lock:
+                                    writer.writerow(
+                                        record_event(
+                                            "verify_success",
+                                            "remote size matched",
+                                            config,
+                                            check_free_space(config),
+                                            f"worker={worker_id}, path={remote_path}",
+                                        )
                                     )
-                                )
-                    if not success:
-                        if "no space" in push_err.lower():
-                            with stats_lock:
-                                stats.last_event = "存储已满，执行全量清理"
-                            with cleanup_lock:
-                                wipe_device_storage(config, writer, writer_lock, "no_space")
-                        elif "timeout" in push_err.lower():
-                            with stats_lock:
-                                stats.last_event = "推送超时，执行全量清理并重试"
-                            with cleanup_lock:
-                                wipe_device_storage(config, writer, writer_lock, "push_timeout")
-                        else:
-                            with cleanup_lock:
-                                cleanup_device_storage(config, writer, writer_lock, "push_failure")
-                    ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
-                    time.sleep(config.poll_interval_seconds)
+                        if not success:
+                            if "no space" in push_err.lower():
+                                with stats_lock:
+                                    stats.last_event = "存储已满，执行全量清理"
+                                with cleanup_lock:
+                                    wipe_device_storage(config, writer, writer_lock, "no_space")
+                            elif "timeout" in push_err.lower():
+                                with stats_lock:
+                                    stats.last_event = "推送超时，执行全量清理并重试"
+                                with cleanup_lock:
+                                    wipe_device_storage(config, writer, writer_lock, "push_timeout")
+                            else:
+                                with cleanup_lock:
+                                    cleanup_device_storage(config, writer, writer_lock, "push_failure")
+                        ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
+                    finally:
+                        task_queue.task_done()
             except Exception as exc:  # noqa: BLE001
                 with writer_lock:
                     writer.writerow(record_event("worker_error", str(exc), config, check_free_space(config)))
                 with stats_lock:
                     stats.last_event = f"线程 {worker_id} 异常: {exc}"
                 ui_queue.put({"type": "status", "message": stats.last_event, "stats": stats})
+            finally:
+                with stats_lock:
+                    if stats.active_workers > 0:
+                        stats.active_workers -= 1
+
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
 
         threads: List[threading.Thread] = []
         for idx in range(config.num_workers):
@@ -528,8 +596,11 @@ def run_stress_test(config: StressTestConfig, ui_queue: queue.Queue, start_time:
                 break
             time.sleep(1)
 
+        task_queue.join()
+
         for t in threads:
             t.join(timeout=5)
+        producer_thread.join(timeout=5)
         health_thread.join(timeout=5)
 
         with writer_lock:
@@ -552,12 +623,16 @@ def build_ui(config: StressTestConfig) -> None:
     cleanup_var = tk.StringVar(value="清理次数: 0")
     bytes_var = tk.StringVar(value="累计传输: 0 MB")
     time_var = tk.StringVar(value=f"累计运行: 0.00h / {config.run_hours}h")
+    worker_var = tk.StringVar(value="活跃线程: 0")
+    inflight_var = tk.StringVar(value="并行中的推送: 0")
 
     tk.Label(root, textvariable=status_var, anchor="w").pack(fill="x", padx=10, pady=5)
     tk.Label(root, textvariable=progress_var, anchor="w").pack(fill="x", padx=10, pady=5)
     tk.Label(root, textvariable=cleanup_var, anchor="w").pack(fill="x", padx=10, pady=5)
     tk.Label(root, textvariable=bytes_var, anchor="w").pack(fill="x", padx=10, pady=5)
     tk.Label(root, textvariable=time_var, anchor="w").pack(fill="x", padx=10, pady=5)
+    tk.Label(root, textvariable=worker_var, anchor="w").pack(fill="x", padx=10, pady=5)
+    tk.Label(root, textvariable=inflight_var, anchor="w").pack(fill="x", padx=10, pady=5)
     progress_bar = ttk.Progressbar(root, mode="determinate", maximum=total_seconds)
     progress_bar.pack(fill="x", padx=10, pady=5)
 
@@ -579,6 +654,8 @@ def build_ui(config: StressTestConfig) -> None:
                 time_var.set(
                     f"累计运行: {elapsed / 3600:.2f}h / {config.run_hours}h"
                 )
+                worker_var.set(f"活跃线程: {stats.active_workers} / {config.num_workers}")
+                inflight_var.set(f"并行中的推送: {stats.inflight_pushes}")
 
                 log_box.configure(state="normal")
                 log_box.insert("end", f"{datetime.utcnow().strftime('%H:%M:%S')} - {event.get('message','')}\n")
@@ -597,6 +674,17 @@ def build_ui(config: StressTestConfig) -> None:
 if __name__ == "__main__":
     try:
         cfg = StressTestConfig()
+        env_workers = os.getenv("STRESS_NUM_WORKERS")
+        env_interval = os.getenv("STRESS_LARGE_INTERVAL")
+        env_queue_mult = os.getenv("STRESS_QUEUE_MULT")
+
+        if env_workers and env_workers.isdigit():
+            cfg.num_workers = max(1, int(env_workers))
+        if env_interval and env_interval.isdigit():
+            cfg.large_push_interval = max(1, int(env_interval))
+        if env_queue_mult and env_queue_mult.isdigit():
+            cfg.task_queue_multiplier = max(2, int(env_queue_mult))
+
         detect_device(cfg)
         build_ui(cfg)
     except Exception as exc:  # noqa: BLE001
